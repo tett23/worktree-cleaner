@@ -14,7 +14,8 @@ const HELP: &str =
 List linked worktrees and explain which ones can be removed.
 Outside a repository, inspect repositories immediately below DIR (default: current directory).
 The default base is the local branch corresponding to each repository's origin/HEAD.
---remove PATH removes one eligible worktree. --remove-all removes all eligible worktrees.";
+--remove PATH removes one eligible worktree. --remove-all removes all eligible worktrees.
+--include-unmerged also includes clean worktrees whose local branch retains their commits.";
 
 #[derive(Default)]
 enum Action {
@@ -28,6 +29,7 @@ enum Action {
 struct Options {
     root: Option<PathBuf>,
     base: Option<OsString>,
+    include_unmerged: bool,
     action: Action,
 }
 
@@ -44,6 +46,9 @@ fn options() -> Result<Option<Options>, String> {
             Some("--help" | "-h") => return Ok(None),
             Some("--root") if options.root.is_none() => options.root = Some(value()?.into()),
             Some("--base") if options.base.is_none() => options.base = Some(value()?),
+            Some("--include-unmerged") if !options.include_unmerged => {
+                options.include_unmerged = true
+            }
             Some("--remove-all") if matches!(options.action, Action::List) => {
                 options.action = Action::All
             }
@@ -128,13 +133,19 @@ fn run() -> Result<(), String> {
         .map_err(|err| format!("{}: {err}", root.display()))?;
     git::init()?;
     let selected = select(&root, &cwd, &options)?;
-    remove(selected, options.base.as_deref(), &cwd)
+    remove(
+        selected,
+        options.base.as_deref(),
+        &cwd,
+        options.include_unmerged,
+    )
 }
 
 struct Candidate {
     repo: PathBuf,
     name: OsString,
     path: PathBuf,
+    inspection: git::Inspection,
 }
 
 fn select(root: &Path, cwd: &Path, options: &Options) -> Result<Vec<Candidate>, String> {
@@ -155,9 +166,18 @@ fn select(root: &Path, cwd: &Path, options: &Options) -> Result<Vec<Candidate>, 
                     continue;
                 }
             };
-            match git::inspect(&repo, &name, &path, options.base.as_deref(), cwd, false) {
+            match git::inspect(
+                &repo,
+                &name,
+                &path,
+                options.base.as_deref(),
+                cwd,
+                false,
+                options.include_unmerged,
+                None,
+            ) {
                 Err(reason) => report(&repo, path.as_os_str(), "keep", &reason)?,
-                Ok(()) => {
+                Ok(inspection) => {
                     let remove = match &options.action {
                         Action::All => true,
                         Action::One(target) => target == &path,
@@ -168,9 +188,10 @@ fn select(root: &Path, cwd: &Path, options: &Options) -> Result<Vec<Candidate>, 
                             repo: repo.clone(),
                             name,
                             path,
+                            inspection,
                         });
                     } else {
-                        report(&repo, path.as_os_str(), "candidate", "clean and integrated")?;
+                        report(&repo, path.as_os_str(), "candidate", &inspection.reason())?;
                     }
                 }
             }
@@ -182,11 +203,31 @@ fn select(root: &Path, cwd: &Path, options: &Options) -> Result<Vec<Candidate>, 
     Ok(selected)
 }
 
-fn remove(selected: Vec<Candidate>, base: Option<&OsStr>, cwd: &Path) -> Result<(), String> {
+fn remove(
+    selected: Vec<Candidate>,
+    base: Option<&OsStr>,
+    cwd: &Path,
+    include_unmerged: bool,
+) -> Result<(), String> {
     let mut failed = false;
-    for Candidate { repo, name, path } in selected {
-        match git::inspect(&repo, &name, &path, base, cwd, true) {
-            Ok(()) => report(&repo, path.as_os_str(), "removed", "clean and integrated")?,
+    for Candidate {
+        repo,
+        name,
+        path,
+        inspection,
+    } in selected
+    {
+        match git::inspect(
+            &repo,
+            &name,
+            &path,
+            base,
+            cwd,
+            true,
+            include_unmerged,
+            Some(&inspection),
+        ) {
+            Ok(removed) => report(&repo, path.as_os_str(), "removed", &removed.reason())?,
             Err(reason) => {
                 failed = true;
                 report(&repo, path.as_os_str(), "keep", &reason)?;
@@ -232,8 +273,52 @@ mod tests {
         let selected = select(&repo, &repo, &options).unwrap();
         assert_eq!(selected.len(), 2);
         fs::write(second.join("new"), "unfinished work").unwrap();
-        assert!(remove(selected, None, &repo).is_err());
+        assert!(remove(selected, None, &repo, false).is_err());
         assert!(!first.exists());
         assert_eq!(fs::read(second.join("new")).unwrap(), b"unfinished work");
+    }
+
+    #[test]
+    fn adr0002_invariant_04_branch_name_change_prevents_removal() {
+        let fixture = common::Fixture::new();
+        let repo = fixture.repo("repo", "main");
+        let worktree = fixture.worktree(&repo, "feature");
+        fs::write(worktree.join("committed"), "one\n").unwrap();
+        common::git(&worktree, &["add", "committed"]);
+        common::git(&worktree, &["commit", "-m", "feature"]);
+        git::init().unwrap();
+        let options = Options {
+            include_unmerged: true,
+            action: Action::All,
+            ..Options::default()
+        };
+        let selected = select(&repo, &repo, &options).unwrap();
+        assert_eq!(selected.len(), 1);
+        common::git(&worktree, &["switch", "-c", "renamed"]);
+        assert!(remove(selected, None, &repo, true).is_err());
+        assert!(worktree.exists());
+    }
+
+    #[test]
+    fn adr0002_invariant_04_commit_change_prevents_removal() {
+        let fixture = common::Fixture::new();
+        let repo = fixture.repo("repo", "main");
+        let worktree = fixture.worktree(&repo, "feature");
+        fs::write(worktree.join("committed"), "one\n").unwrap();
+        common::git(&worktree, &["add", "committed"]);
+        common::git(&worktree, &["commit", "-m", "feature"]);
+        git::init().unwrap();
+        let options = Options {
+            include_unmerged: true,
+            action: Action::All,
+            ..Options::default()
+        };
+        let selected = select(&repo, &repo, &options).unwrap();
+        assert_eq!(selected.len(), 1);
+        fs::write(worktree.join("later"), "two\n").unwrap();
+        common::git(&worktree, &["add", "later"]);
+        common::git(&worktree, &["commit", "-m", "later"]);
+        assert!(remove(selected, None, &repo, true).is_err());
+        assert!(worktree.exists());
     }
 }

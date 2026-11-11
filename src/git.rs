@@ -107,6 +107,23 @@ struct Index(*mut c_void);
 
 pub type Registration = (OsString, Result<PathBuf, String>);
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Inspection {
+    pub branch: OsString,
+    pub commit: [u8; 20],
+    pub unmerged: bool,
+}
+
+impl Inspection {
+    pub fn reason(&self) -> String {
+        if self.unmerged {
+            format!("clean unmerged branch {}", self.branch.to_string_lossy())
+        } else {
+            "clean and integrated".to_owned()
+        }
+    }
+}
+
 impl Drop for Repo {
     fn drop(&mut self) {
         unsafe { git_repository_free(self.0) }
@@ -365,6 +382,7 @@ fn ensure_clean(repo: &Repo, root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn inspect(
     repo_path: &Path,
     name: &OsStr,
@@ -372,7 +390,9 @@ pub fn inspect(
     base: Option<&OsStr>,
     cwd: &Path,
     remove: bool,
-) -> Result<(), String> {
+    include_unmerged: bool,
+    expected: Option<&Inspection>,
+) -> Result<Inspection, String> {
     let main = main_repo(repo_path)?;
     let worktree = lookup_worktree(&main, name)?;
     check(
@@ -480,10 +500,43 @@ pub fn inspect(
     if target_oid.is_null() || head_oid.is_null() {
         return Err("branch has no commit".to_owned());
     }
-    let included = unsafe { git_oid_equal(target_oid, head_oid) } == 1
-        || unsafe { git_graph_descendant_of(main.0, target_oid, head_oid) } == 1;
-    if !included {
+    let descendant = unsafe { git_graph_descendant_of(main.0, target_oid, head_oid) };
+    if descendant < 0 {
+        return Err(error("check commit ancestry"));
+    }
+    let included = unsafe { git_oid_equal(target_oid, head_oid) } == 1 || descendant == 1;
+    if !included && !include_unmerged {
         return Err("branch is not merged into base".to_owned());
+    }
+    let branch = unsafe { CStr::from_ptr(head_name) }
+        .to_bytes()
+        .strip_prefix(b"refs/heads/")
+        .ok_or("worktree HEAD is detached")?;
+    if !included {
+        let direct = lookup_reference(&linked, c"HEAD")?;
+        let symbolic = unsafe { git_reference_symbolic_target(direct.0) };
+        if symbolic.is_null()
+            || unsafe { CStr::from_ptr(symbolic) } != unsafe { CStr::from_ptr(head_name) }
+        {
+            return Err("HEAD does not directly name the retained branch".to_owned());
+        }
+        let direct_branch = lookup_reference(&linked, unsafe { CStr::from_ptr(symbolic) })?;
+        if unsafe { git_reference_target(direct_branch.0) }.is_null()
+            || unsafe { git_oid_equal(git_reference_target(direct_branch.0), head_oid) } != 1
+        {
+            return Err("retained branch no longer points to HEAD".to_owned());
+        }
+    }
+    let inspection = Inspection {
+        branch: OsString::from_vec(branch.to_vec()),
+        commit: unsafe { *(head_oid as *const [u8; 20]) },
+        unmerged: !included,
+    };
+    if let Some(expected) = expected
+        && (inspection.unmerged || expected.unmerged)
+        && (inspection.branch != expected.branch || inspection.commit != expected.commit)
+    {
+        return Err("branch or commit changed after selection".to_owned());
     }
     ensure_clean(&linked, &registered)?;
     if remove {
@@ -497,5 +550,5 @@ pub fn inspect(
             "remove worktree",
         )?;
     }
-    Ok(())
+    Ok(inspection)
 }

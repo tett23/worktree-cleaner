@@ -388,3 +388,76 @@ fn invariant_14_registered_worktree_outside_root_is_discovered() {
     let output = cleaner(&root, &["--base", "main"]);
     assert_eq!(decision(&output, &worktree), "candidate");
 }
+
+#[test]
+fn adr0002_invariant_01_02_opt_in_unmerged() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo("project", "main");
+    let worktree = fixture.worktree(&repo, "feature");
+    fs::write(worktree.join("committed"), "one\n").unwrap();
+    git(&worktree, &["add", "committed"]);
+    git(&worktree, &["commit", "-m", "feature"]);
+    assert_eq!(
+        decision(&cleaner(&repo, &["--base", "main"]), &worktree),
+        "keep"
+    );
+    let result = cleaner(&repo, &["--base", "main", "--include-unmerged"]);
+    assert_eq!(decision(&result, &worktree), "candidate");
+    let line = rows(&result)
+        .into_iter()
+        .find(|r| r[1] == worktree.to_str().unwrap())
+        .unwrap();
+    assert!(line[3].contains("unmerged") && line[3].contains("feature"));
+}
+
+#[test]
+fn adr0002_invariant_02_dirty_and_detached_remain() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo("project", "main");
+    let dirty = fixture.worktree(&repo, "dirty");
+    fs::write(dirty.join("committed"), "one\n").unwrap();
+    git(&dirty, &["add", "committed"]);
+    git(&dirty, &["commit", "-m", "feature"]);
+    fs::write(dirty.join("untracked"), "work\n").unwrap();
+    let detached = fixture.worktree(&repo, "detached");
+    fs::write(detached.join("committed"), "one\n").unwrap();
+    git(&detached, &["add", "committed"]);
+    git(&detached, &["commit", "-m", "feature"]);
+    git(&detached, &["checkout", "--detach"]);
+    let result = cleaner(&repo, &["--base", "main", "--include-unmerged"]);
+    assert_eq!(decision(&result, &dirty), "keep");
+    assert_eq!(decision(&result, &detached), "keep");
+}
+
+#[test]
+fn adr0002_invariant_03_05_branch_survives_removal() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo("project", "main");
+    let worktree = fixture.worktree(&repo, "feature");
+    fs::write(worktree.join("committed"), "unique\n").unwrap();
+    git(&worktree, &["add", "committed"]);
+    git(&worktree, &["commit", "-m", "feature"]);
+    let before = git(&repo, &["rev-parse", "refs/heads/feature"]);
+    let result = cleaner(&repo, &["--base", "main", "--include-unmerged"]);
+    assert_eq!(decision(&result, &worktree), "candidate");
+    assert!(worktree.exists());
+    assert_eq!(git(&repo, &["rev-parse", "refs/heads/feature"]), before);
+    let result = cleaner(
+        &repo,
+        &[
+            "--base",
+            "main",
+            "--include-unmerged",
+            "--remove",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(decision(&result, &worktree), "removed");
+    assert_eq!(git(&repo, &["rev-parse", "refs/heads/feature"]), before);
+    let recovered = fixture.path.join("recovered");
+    git(
+        &repo,
+        &["worktree", "add", recovered.to_str().unwrap(), "feature"],
+    );
+    assert_eq!(fs::read(recovered.join("committed")).unwrap(), b"unique\n");
+}
