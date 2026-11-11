@@ -1,0 +1,1 @@
+//! Git linked worktree cleanup.

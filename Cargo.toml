@@ -1,0 +1,7 @@
+[package]
+name = "worktree-cleaner"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/tett23/worktree-cleaner"
+description = "Clean up Git linked worktrees after integration"
