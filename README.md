@@ -15,9 +15,19 @@ The first command lists each worktree with its repository, path, decision and re
 
 Each repository uses the local branch named by its locally recorded `origin/HEAD`. For example, `origin/main` selects the local `main` branch. Supply `--base main` to choose that local branch explicitly. If the base cannot be resolved, the repository's worktrees are kept.
 
-By default, a candidate must be on a local branch whose tip is reachable from the base tip. The cleaner keeps the base branch's worktree, locked worktrees and the worktree containing the current directory. Staged or unstaged changes, untracked or ignored files, nested repositories, submodules, an unfinished Git operation or an inconclusive check also prevent removal.
+By default, a candidate must be on a local branch whose tip is reachable from the base tip. The cleaner keeps the base branch's worktree, locked worktrees by default, and the worktree containing the current directory. Staged or unstaged changes, untracked or ignored files, nested repositories, submodules, an unfinished Git operation or an inconclusive check also prevent removal.
 
 Use `--include-unmerged` to list clean worktrees whose commits are still on an unmerged local branch. Add `--remove PATH` or `--remove-all` to remove them while keeping the branch. The cleaner checks the branch name and commit again before removal. You can check out that branch later to recover the committed files.
+
+Use `--github-merged` to check a clean, divergent branch against GitHub.com with an authenticated `gh` executable. This also works for squash or rebase merges if the merged PR has the exact local branch tip and its merge commit is in the local base branch. The listing shows the matching PR URL. The cleaner queries it again before removal. Without this option, cleanup runs offline.
+
+On macOS, `--reclaim-agent-locks` checks Claude agent locks whose recorded owner has exited. Use it only for private worktrees created on this host, with no concurrent use or lock changes. A reused PID qualifies only when the recorded start times establish their order despite timezone uncertainty. The option keeps manual locks and worktrees with uncommitted or ignored files. A locked worktree needs evidence of integration even when `--include-unmerged` is set.
+
+```sh
+worktree-cleaner --root ~/repositories/src/github.com/tett23 --reclaim-agent-locks --github-merged
+```
+
+This command previews eligible worktrees without releasing any lock. Add `--remove PATH` or `--remove-all` to reclaim eligible locks and remove the corresponding worktrees.
 
 ## Installation
 
