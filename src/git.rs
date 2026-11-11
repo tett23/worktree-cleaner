@@ -1,5 +1,6 @@
 //! Small, direct bindings to the installed libgit2 API used for worktree cleanup.
 
+use crate::{Options, github, locks};
 use std::ffi::{CStr, CString, OsStr, OsString, c_char, c_int, c_void};
 use std::fs;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -57,6 +58,9 @@ unsafe extern "C" {
         flags: u32,
         ceiling_dirs: *const c_char,
     ) -> c_int;
+    fn git_remote_lookup(out: *mut *mut c_void, repo: *mut c_void, name: *const c_char) -> c_int;
+    fn git_remote_url(remote: *mut c_void) -> *const c_char;
+    fn git_remote_free(remote: *mut c_void);
     fn git_repository_free(repo: *mut c_void);
     fn git_repository_path(repo: *mut c_void) -> *const c_char;
     fn git_repository_workdir(repo: *mut c_void) -> *const c_char;
@@ -112,15 +116,27 @@ pub struct Inspection {
     pub branch: OsString,
     pub commit: [u8; 20],
     pub unmerged: bool,
+    github: Option<github::Evidence>,
+    lock: Option<(PathBuf, locks::LockEvidence)>,
 }
 
 impl Inspection {
     pub fn reason(&self) -> String {
-        if self.unmerged {
+        let mut reason = if let Some(pr) = &self.github {
+            format!("clean and integrated via {}", pr.url)
+        } else if self.unmerged {
             format!("clean unmerged branch {}", self.branch.to_string_lossy())
         } else {
             "clean and integrated".to_owned()
+        };
+        if let Some((_, lock)) = &self.lock {
+            reason.push_str(&format!(
+                "; lock {:?}: {}",
+                String::from_utf8_lossy(&lock.reason),
+                lock.explanation
+            ));
         }
+        reason
     }
 }
 
@@ -382,17 +398,93 @@ fn ensure_clean(repo: &Repo, root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn inspect(
+// A removal pass queries GitHub once, then repeats the local checks after the
+// network round trip. The listing pass and removal pass never share a reply.
+struct PrReply {
+    origin: String,
+    base: String,
+    head: [u8; 20],
+    prs: Vec<github::Evidence>,
+}
+
+fn merged_pr(
+    main: &Repo,
+    target: &Reference,
+    head: &[u8; 20],
+    reply: &mut Option<PrReply>,
+) -> Result<Option<github::Evidence>, String> {
+    let mut remote = ptr::null_mut();
+    check(
+        unsafe { git_remote_lookup(&mut remote, main.0, c"origin".as_ptr()) },
+        "read origin",
+    )?;
+    let url = unsafe { git_remote_url(remote) };
+    let url = if url.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(url) }
+            .to_str()
+            .ok()
+            .map(str::to_owned)
+    };
+    unsafe { git_remote_free(remote) };
+    let url = url.ok_or("origin has no usable URL")?;
+    let base = unsafe { CStr::from_ptr(git_reference_name(target.0)) }
+        .to_str()
+        .ok()
+        .and_then(|name| name.strip_prefix("refs/heads/"))
+        .ok_or("invalid base branch")?;
+    let head_hex: String = head.iter().map(|byte| format!("{byte:02x}")).collect();
+    let base_oid = unsafe { git_reference_target(target.0) };
+    let reply = match reply {
+        Some(previous)
+            if previous.origin == url && previous.base == base && previous.head == *head =>
+        {
+            previous
+        }
+        Some(_) => return Err("GitHub query target changed during recheck".into()),
+        empty => {
+            let prs = github::merged_prs(&url, base, &head_hex)?;
+            empty.insert(PrReply {
+                origin: url,
+                base: base.into(),
+                head: *head,
+                prs,
+            })
+        }
+    };
+    for pr in &reply.prs {
+        let mut oid = [0u8; 20];
+        for (i, byte) in oid.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&pr.merge_commit[2 * i..2 * i + 2], 16)
+                .map_err(|_| "invalid merge commit")?;
+        }
+        let merge = oid.as_ptr().cast();
+        if unsafe { git_oid_equal(base_oid, merge) } == 1 {
+            return Ok(Some(pr.clone()));
+        }
+        match unsafe { git_graph_descendant_of(main.0, base_oid, merge) } {
+            1 => return Ok(Some(pr.clone())),
+            0 | -3 => continue,
+            _ => return Err(error("check PR merge commit ancestry")),
+        }
+    }
+    Ok(None)
+}
+
+struct Checked {
+    inspection: Inspection,
+    worktree: Worktree,
+}
+
+fn evaluate(
     repo_path: &Path,
     name: &OsStr,
     path: &Path,
-    base: Option<&OsStr>,
+    options: &Options,
     cwd: &Path,
-    remove: bool,
-    include_unmerged: bool,
-    expected: Option<&Inspection>,
-) -> Result<Inspection, String> {
+    reply: &mut Option<PrReply>,
+) -> Result<Checked, String> {
     let main = main_repo(repo_path)?;
     let worktree = lookup_worktree(&main, name)?;
     check(
@@ -403,7 +495,7 @@ pub fn inspect(
     if locked < 0 {
         return Err(error("read worktree lock"));
     }
-    if locked > 0 {
+    if locked > 0 && !options.reclaim_agent_locks {
         return Err("worktree is locked".to_owned());
     }
     let registered = fs::canonicalize(unsafe { path_from_c(git_worktree_path(worktree.0))? })
@@ -466,14 +558,21 @@ pub fn inspect(
     }
     let linked_gitdir = fs::canonicalize(unsafe { path_from_c(git_repository_path(linked.0))? })
         .map_err(|e| e.to_string())?;
-    let expected_gitdir = fs::canonicalize(registration_dir).map_err(|e| e.to_string())?;
+    let expected_gitdir = fs::canonicalize(&registration_dir).map_err(|e| e.to_string())?;
     if linked_gitdir != expected_gitdir {
         return Err("linked worktree registration differs".to_owned());
     }
     if unsafe { git_repository_state(linked.0) } != 0 {
         return Err("Git operation is in progress".to_owned());
     }
-    let target = base_ref(&main, base)?;
+    let lock = if locked > 0 {
+        let lock_path = registration_dir.join("locked");
+        let evidence = locks::inspect(&lock_path, &registered, name)?;
+        Some((lock_path, evidence))
+    } else {
+        None
+    };
+    let target = base_ref(&main, options.base.as_deref())?;
     let head = {
         let mut pointer = ptr::null_mut();
         check(
@@ -505,7 +604,7 @@ pub fn inspect(
         return Err(error("check commit ancestry"));
     }
     let included = unsafe { git_oid_equal(target_oid, head_oid) } == 1 || descendant == 1;
-    if !included && !include_unmerged {
+    if !included && !options.github_merged && (!options.include_unmerged || lock.is_some()) {
         return Err("branch is not merged into base".to_owned());
     }
     let branch = unsafe { CStr::from_ptr(head_name) }
@@ -527,28 +626,92 @@ pub fn inspect(
             return Err("retained branch no longer points to HEAD".to_owned());
         }
     }
+    ensure_clean(&linked, &registered)?;
+    let commit = unsafe { *(head_oid as *const [u8; 20]) };
+    let github = if !included && options.github_merged {
+        merged_pr(&main, &target, &commit, reply)?
+    } else {
+        None
+    };
+    let unmerged = !included && github.is_none();
+    if unmerged && (!options.include_unmerged || lock.is_some()) {
+        return Err("no matching integrated pull request for this branch tip".into());
+    }
     let inspection = Inspection {
         branch: OsString::from_vec(branch.to_vec()),
-        commit: unsafe { *(head_oid as *const [u8; 20]) },
-        unmerged: !included,
+        commit,
+        unmerged,
+        github,
+        lock,
     };
-    if let Some(expected) = expected
-        && (inspection.unmerged || expected.unmerged)
-        && (inspection.branch != expected.branch || inspection.commit != expected.commit)
-    {
-        return Err("branch or commit changed after selection".to_owned());
+    Ok(Checked {
+        inspection,
+        worktree,
+    })
+}
+
+fn prune(worktree: &Worktree) -> Result<(), String> {
+    // VALID permits an existing worktree and WORKING_TREE removes the directory.
+    // Deliberately omit LOCKED so a reacquired lock still protects it.
+    let mut options = GitPruneOptions {
+        version: 1,
+        flags: 1 | 4,
+    };
+    check(
+        unsafe { git_worktree_prune(worktree.0, &mut options) },
+        "remove worktree",
+    )
+}
+
+pub fn inspect(
+    repo_path: &Path,
+    name: &OsStr,
+    path: &Path,
+    options: &Options,
+    cwd: &Path,
+    expected: Option<&Inspection>,
+) -> Result<Inspection, String> {
+    let mut reply = None;
+    let mut checked = evaluate(repo_path, name, path, options, cwd, &mut reply)?;
+    if expected.is_some() && reply.is_some() {
+        checked = evaluate(repo_path, name, path, options, cwd, &mut reply)?;
     }
-    ensure_clean(&linked, &registered)?;
-    if remove {
-        // VALID permits a present worktree, WORKING_TREE removes its directory.
-        let mut options = GitPruneOptions {
-            version: 1,
-            flags: 1 | 4,
-        };
-        check(
-            unsafe { git_worktree_prune(worktree.0, &mut options) },
-            "remove worktree",
+    let current = checked.inspection;
+    let Some(expected) = expected else {
+        return Ok(current);
+    };
+    let protected = |inspection: &Inspection| {
+        inspection.unmerged || inspection.github.is_some() || inspection.lock.is_some()
+    };
+    if (protected(&current) || protected(expected)) && &current != expected {
+        return Err(
+            "worktree branch, commit, lock or integration evidence changed after selection".into(),
+        );
+    }
+    if let Some((lock_path, lock)) = &current.lock {
+        locks::reclaim_and_remove(
+            lock_path,
+            path,
+            name,
+            lock,
+            |unlocked| {
+                let verified =
+                    evaluate(repo_path, name, path, options, cwd, &mut reply)?.inspection;
+                let mut wanted = expected.clone();
+                if unlocked {
+                    wanted.lock = None;
+                }
+                if verified != wanted {
+                    return Err(
+                        "worktree or integration evidence changed during lock reclamation".into(),
+                    );
+                }
+                Ok(())
+            },
+            || prune(&checked.worktree),
         )?;
+    } else {
+        prune(&checked.worktree)?;
     }
-    Ok(inspection)
+    Ok(current)
 }
