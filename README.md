@@ -54,3 +54,9 @@ CI checks document changes and protects committed decisions, audit reports and b
 ## License
 
 [MIT](LICENSE)
+
+## Removal results
+
+A failed removal is reported as a `keep` row with its cause, and processing continues with the remaining candidates. A failed deletion may leave partially removed files or registration data, which the reason field reports along with any lock recovery result.
+
+After a removal run, standard error shows the attempted, removed and failed counts. Any failed attempt produces exit code 1 after the remaining candidates have been processed. Worktrees excluded during the initial inspection do not count as failed attempts. If a result cannot be written to standard output, cleanup stops before attempting the next candidate. Listing runs and errors during candidate selection do not print a removal summary.

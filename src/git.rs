@@ -650,17 +650,22 @@ fn evaluate(
     })
 }
 
-fn prune(worktree: &Worktree) -> Result<(), String> {
+fn prune(worktree: &Worktree, repo_path: &Path, name: &OsStr, path: &Path) -> Result<(), String> {
     // VALID permits an existing worktree and WORKING_TREE removes the directory.
     // Deliberately omit LOCKED so a reacquired lock still protects it.
     let mut options = GitPruneOptions {
         version: 1,
         flags: 1 | 4,
     };
+    let main = main_repo(repo_path)?;
+    let registration = unsafe { path_from_c(git_repository_commondir(main.0))? }
+        .join("worktrees")
+        .join(name);
     check(
         unsafe { git_worktree_prune(worktree.0, &mut options) },
         "remove worktree",
     )
+    .map_err(|reason| removal_failure(reason, path, &registration))
 }
 
 pub fn inspect(
@@ -708,10 +713,41 @@ pub fn inspect(
                 }
                 Ok(())
             },
-            || prune(&checked.worktree),
+            || prune(&checked.worktree, repo_path, name, path),
         )?;
     } else {
-        prune(&checked.worktree)?;
+        prune(&checked.worktree, repo_path, name, path)?;
     }
     Ok(current)
+}
+
+fn removal_failure(reason: String, path: &Path, registration: &Path) -> String {
+    let state = |path: &Path| match fs::symlink_metadata(path) {
+        Ok(_) => "present (contents may be partially removed)".to_owned(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "absent".to_owned(),
+        Err(error) => format!("unknown ({error})"),
+    };
+    format!(
+        "{reason}; removal may be partial; worktree {}: {}; registration {}: {}",
+        path.display(),
+        state(path),
+        registration.display(),
+        state(registration)
+    )
+}
+
+#[cfg(test)]
+mod removal_tests {
+    use super::*;
+    #[test]
+    fn adr0004_invariant_2_partial_removal_reports_remaining_state() {
+        let fixture = crate::common::Fixture::new();
+        let worktree = fixture.path.join("worktree");
+        fs::create_dir(&worktree).unwrap();
+        let registration = fixture.path.join("missing-registration");
+        let error = removal_failure("prune failed".into(), &worktree, &registration);
+        assert!(error.contains("removal may be partial"));
+        assert!(error.contains("present (contents may be partially removed)"));
+        assert!(error.ends_with(": absent"));
+    }
 }
