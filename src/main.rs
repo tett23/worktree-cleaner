@@ -200,26 +200,73 @@ fn select(root: &Path, cwd: &Path, options: &Options) -> Result<Vec<Candidate>, 
 }
 
 fn remove(selected: Vec<Candidate>, options: &Options, cwd: &Path) -> Result<(), String> {
-    let mut failed = false;
-    for Candidate {
-        repo,
-        name,
-        path,
-        inspection,
-    } in selected
-    {
-        match git::inspect(&repo, &name, &path, options, cwd, Some(&inspection)) {
-            Ok(removed) => report(&repo, path.as_os_str(), "removed", &removed.reason())?,
-            Err(reason) => {
-                failed = true;
-                report(&repo, path.as_os_str(), "keep", &reason)?;
+    if matches!(options.action, Action::List) {
+        return Ok(());
+    }
+    let (summary, result) = remove_with(
+        selected,
+        |candidate| {
+            git::inspect(
+                &candidate.repo,
+                &candidate.name,
+                &candidate.path,
+                options,
+                cwd,
+                Some(&candidate.inspection),
+            )
+        },
+        |candidate, decision, reason| {
+            report(
+                &candidate.repo,
+                candidate.path.as_os_str(),
+                decision,
+                reason,
+            )
+        },
+    );
+    eprintln!(
+        "attempted={} removed={} failed={}",
+        summary.attempted, summary.removed, summary.failed
+    );
+    result
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct Summary {
+    attempted: usize,
+    removed: usize,
+    failed: usize,
+}
+
+fn remove_with(
+    selected: Vec<Candidate>,
+    mut remove_one: impl FnMut(&Candidate) -> Result<git::Inspection, String>,
+    mut write_result: impl FnMut(&Candidate, &str, &str) -> Result<(), String>,
+) -> (Summary, Result<(), String>) {
+    let mut summary = Summary::default();
+    for candidate in &selected {
+        summary.attempted += 1;
+        let (decision, reason) = match remove_one(candidate) {
+            Ok(inspection) => {
+                summary.removed += 1;
+                ("removed", inspection.reason())
             }
+            Err(reason) => {
+                summary.failed += 1;
+                ("keep", reason)
+            }
+        };
+        if let Err(error) = write_result(candidate, decision, &reason) {
+            return (summary, Err(error));
         }
     }
-    if failed {
-        Err("could not complete all selected removals".into())
+    if summary.failed > 0 {
+        (
+            summary,
+            Err("could not complete all selected removals".into()),
+        )
     } else {
-        Ok(())
+        (summary, Ok(()))
     }
 }
 
@@ -240,6 +287,161 @@ mod common;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adr0004_invariants_01_02_04_failure_then_success() {
+        let fixture = common::Fixture::new();
+        let repo = fixture.repo("repo", "main");
+        let first = fixture.worktree(&repo, "first");
+        let second = fixture.worktree(&repo, "second");
+        git::init().unwrap();
+        let options = Options {
+            action: Action::All,
+            ..Options::default()
+        };
+        let mut selected = select(&repo, &repo, &options).unwrap();
+        selected.sort_by_key(|candidate| candidate.path != first);
+        let mut tried = Vec::new();
+        let result = remove_with(
+            selected,
+            |candidate| {
+                tried.push(candidate.path.clone());
+                if candidate.path == first {
+                    Err("injected removal failure".into())
+                } else {
+                    Ok(candidate.inspection.clone())
+                }
+            },
+            |_, _, _| Ok(()),
+        );
+        assert!(result.1.is_err());
+        assert_eq!(tried, vec![first, second]);
+    }
+
+    #[test]
+    fn adr0004_invariants_02_03_04_all_count_boundaries() {
+        let fixture = common::Fixture::new();
+        let repo = fixture.repo("repo", "main");
+        fixture.worktree(&repo, "first");
+        fixture.worktree(&repo, "second");
+        git::init().unwrap();
+        let options = Options {
+            action: Action::All,
+            ..Options::default()
+        };
+        let cases: &[(&[bool], Summary, bool)] = &[
+            (
+                &[],
+                Summary {
+                    attempted: 0,
+                    removed: 0,
+                    failed: 0,
+                },
+                false,
+            ),
+            (
+                &[true],
+                Summary {
+                    attempted: 1,
+                    removed: 1,
+                    failed: 0,
+                },
+                false,
+            ),
+            (
+                &[false],
+                Summary {
+                    attempted: 1,
+                    removed: 0,
+                    failed: 1,
+                },
+                true,
+            ),
+            (
+                &[false, true],
+                Summary {
+                    attempted: 2,
+                    removed: 1,
+                    failed: 1,
+                },
+                true,
+            ),
+            (
+                &[false, false],
+                Summary {
+                    attempted: 2,
+                    removed: 0,
+                    failed: 2,
+                },
+                true,
+            ),
+        ];
+        for (outcomes, expected, expected_error) in cases {
+            let mut selected = select(&repo, &repo, &options).unwrap();
+            selected.truncate(outcomes.len());
+            let mut index = 0;
+            let (summary, result) = remove_with(
+                selected,
+                |candidate| {
+                    let success = outcomes[index];
+                    index += 1;
+                    if success {
+                        Ok(candidate.inspection.clone())
+                    } else {
+                        Err("injected lock restoration failure".into())
+                    }
+                },
+                |_, _, _| Ok(()),
+            );
+            assert_eq!(&summary, expected);
+            assert_eq!(result.is_err(), *expected_error);
+            assert_eq!(summary.attempted, summary.removed + summary.failed);
+        }
+    }
+
+    #[test]
+    fn adr0004_invariant_06_output_failure_stops_removal() {
+        let fixture = common::Fixture::new();
+        let repo = fixture.repo("repo", "main");
+        fixture.worktree(&repo, "first");
+        fixture.worktree(&repo, "second");
+        git::init().unwrap();
+        let options = Options {
+            action: Action::All,
+            ..Options::default()
+        };
+        let selected = select(&repo, &repo, &options).unwrap();
+        let mut tries = 0;
+        let result = remove_with(
+            selected,
+            |candidate| {
+                tries += 1;
+                Ok(candidate.inspection.clone())
+            },
+            |_, _, _| Err("injected stdout failure".into()),
+        );
+        assert!(result.1.is_err());
+        assert_eq!(tries, 1);
+    }
+
+    #[test]
+    fn adr0004_invariant_01_real_first_failure_preserves_second_progress() {
+        let fixture = common::Fixture::new();
+        let repo = fixture.repo("repo", "main");
+        let first = fixture.worktree(&repo, "first");
+        let second = fixture.worktree(&repo, "second");
+        git::init().unwrap();
+        let options = Options {
+            action: Action::All,
+            ..Options::default()
+        };
+        let mut selected = select(&repo, &repo, &options).unwrap();
+        selected.sort_by_key(|candidate| candidate.path != first);
+        fs::write(first.join("new"), "unfinished\n").unwrap();
+        assert!(remove(selected, &options, &repo).is_err());
+        assert!(first.exists());
+        assert!(!second.exists());
+    }
 
     #[test]
     fn invariant_12_remove_all_rechecks_after_selection() {

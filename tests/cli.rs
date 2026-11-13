@@ -20,6 +20,37 @@ fn cleaner(cwd: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+#[test]
+fn adr0004_invariants_02_03_04_05_summary_excludes_initially_kept() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo("project", "main");
+    let clean = fixture.worktree(&repo, "clean");
+    let dirty = fixture.worktree(&repo, "dirty");
+    fs::write(dirty.join("untracked"), "work\n").unwrap();
+    let output = cleaner(&repo, &["--base", "main", "--remove-all"]);
+    assert!(output.status.success());
+    assert_eq!(decision(&output, &clean), "removed");
+    assert_eq!(decision(&output, &dirty), "keep");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("attempted=1 removed=1 failed=0"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn adr0004_invariant_03_empty_selection_reports_zero() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo("project", "main");
+    let output = cleaner(&repo, &["--remove-all"]);
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("attempted=0 removed=0 failed=0"),
+        "{stderr}"
+    );
+}
+
 fn rows(output: &Output) -> Vec<Vec<String>> {
     assert!(
         output.status.success(),
