@@ -1,6 +1,6 @@
 # ADR 0005: adr-guard を v0.13.1 に上げ、ADR のステータス行を新形式に移す
 
-Status: accepted-pending
+Status: accepted
 
 ## 文脈
 
