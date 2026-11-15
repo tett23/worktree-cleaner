@@ -1,6 +1,6 @@
 # ADR 0001: マージ済みの worktree を整理する
 
-ステータス: 採択
+Status: accepted
 
 ## 文脈
 
