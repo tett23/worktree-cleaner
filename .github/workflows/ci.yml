@@ -10,10 +10,29 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # A new branch or tag has no "before" (all zeros), and adr-guard would
+      # then check the whole history; start from the merge base with main
+      # instead (docs/adr/0006)
+      - id: range
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+          HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            base="$PR_BASE"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ]; then
+            base="$BEFORE"
+          else
+            base=$(git merge-base origin/main "$HEAD")
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD" >> "$GITHUB_OUTPUT"
       - uses: tett23/adr-guard@v0.13.1
         with:
-          base: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-          head: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          base: ${{ steps.range.outputs.base }}
+          head: ${{ steps.range.outputs.head }}
           allow-status: true
           allow-links: true
 
