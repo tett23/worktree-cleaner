@@ -1,6 +1,6 @@
 # ADR 0006: 新しいブランチの push では、main との merge-base から ADR を検査する
 
-Status: proposed
+Status: accepted-pending
 
 ## 文脈
 
