@@ -41,7 +41,9 @@ If libgit2 is outside the linker's search path, set `RUSTFLAGS="-L native=/path/
 
 ## Development
 
-Install [adr-guard](https://github.com/tett23/adr-guard) and enable the repository hook after cloning. The integration tests use Git to create disposable repositories.
+Install [adr-guard](https://github.com/tett23/adr-guard) v0.13.1 or later and enable the repository hook after cloning. The integration tests use Git to create disposable repositories.
+
+Each ADR has exactly one status line of the form `Status: <token>`, where the token is `proposed`, `accepted`, `accepted-pending`, `rejected`, `discarded`, `deprecated`, or `superseded [<JSON array of changes>]`. Commit a new ADR with `Status: proposed` first, and change its status in a later commit. The pre-commit hook and CI check the state transitions of status lines ([ADR 0005](docs/adr/0005-update-adr-guard-to-v0.13.1.md)).
 
 ```sh
 git config core.hooksPath .githooks
