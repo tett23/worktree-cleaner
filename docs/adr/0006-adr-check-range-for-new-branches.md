@@ -1,6 +1,6 @@
 # ADR 0006: 新しいブランチの push では、main との merge-base から ADR を検査する
 
-Status: accepted
+Status: superseded [{"part":"実装すること","by":["docs/adr/0012-adr-check-range-after-force-push.md"]}]
 
 ## 文脈
 
