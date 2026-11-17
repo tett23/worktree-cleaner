@@ -38,6 +38,7 @@ struct Options {
     github_merged: bool,
     remote_base: bool,
     reclaim_agent_locks: bool,
+    allow_ignored: bool,
     action: Action,
 }
 

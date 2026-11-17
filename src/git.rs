@@ -794,4 +794,35 @@ mod removal_tests {
         assert!(error.contains("present (contents may be partially removed)"));
         assert!(error.ends_with(": absent"));
     }
+
+    #[test]
+    fn adr0008_i9_recheck_keeps_worktree_with_new_untracked_file() {
+        let fixture = crate::common::Fixture::new();
+        let repo = fixture.repo("project", "main");
+        fs::write(repo.join(".gitignore"), "*.log\n").unwrap();
+        crate::common::git(&repo, &["add", ".gitignore"]);
+        crate::common::git(&repo, &["commit", "-m", "ignore logs"]);
+        let worktree = fixture.worktree(&repo, "done");
+        fs::write(worktree.join("build.log"), "log\n").unwrap();
+        init().unwrap();
+        let options = Options {
+            base: Some("main".into()),
+            allow_ignored: true,
+            ..Options::default()
+        };
+        let name = OsStr::new("done-worktree");
+        let selected = inspect(&repo, name, &worktree, &options, &repo, None).unwrap();
+        assert_eq!(
+            selected.reason(),
+            "clean and integrated; deletes 1 ignored files"
+        );
+        fs::write(worktree.join("notes"), "work\n").unwrap();
+        let error = inspect(&repo, name, &worktree, &options, &repo, Some(&selected)).unwrap_err();
+        assert!(error.contains("change"), "{error}");
+        assert_eq!(fs::read(worktree.join("notes")).unwrap(), b"work\n");
+        assert!(worktree.join("build.log").exists());
+        fs::remove_file(worktree.join("notes")).unwrap();
+        inspect(&repo, name, &worktree, &options, &repo, Some(&selected)).unwrap();
+        assert!(!worktree.exists());
+    }
 }
