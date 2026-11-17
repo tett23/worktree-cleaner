@@ -52,6 +52,12 @@ worktree-cleaner はローカルの Git リポジトリに登録された linked
 現在の HEAD とマージ済み PR の先端、対象リポジトリ、基準ブランチが一致し、PR のマージコミットが基準から到達可能な場合を統合済みと扱う。
 削除前には同じ証拠を再取得する。
 判定の条件は [ADR 0003](adr/0003-reclaim-agent-locks-and-check-merged-prs.md) に記載する。
+`--include-unmerged` と組み合わせると、ロックのない worktree は、照会に失敗しても保持せず、未マージの候補とする。
+照会の失敗には、origin の URL が github.com の既知の形式でないこと、gh の失敗、PR のマージコミットがローカルにないことを含む。
+その理由は `clean unmerged branch <ブランチ>; GitHub check failed: <原因>` と表示する。
+削除直前の再照会で条件を満たす PR が見つかったときは、証拠が変わったので保持する。
+ロック付きの worktree と、`--include-unmerged` を指定しない実行では、照会の失敗は保持の理由になる。
+詳細は [ADR 0014](adr/0014-unmerged-candidates-despite-github-failures.md) に記載する。
 
 `--remote-base` を指定すると、各リポジトリで基準の名前を同じ方法で決め、到達の判定には `refs/remotes/origin/<名前>` を使う。
 この参照は利用者が最後に fetch した時点の値であり、worktree-cleaner は fetch もローカルの基準ブランチの更新も行わない。
