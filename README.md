@@ -26,9 +26,11 @@ By default, a candidate must be on a local branch whose tip is reachable from th
 
 Use `--include-unmerged` to list clean worktrees whose commits are still on an unmerged local branch. Add `--remove PATH` or `--remove-all` to remove them while keeping the branch. The cleaner checks the branch name and commit again before removal. You can check out that branch later to recover the committed files.
 
+Use `--allow-ignored` when ignored files such as build output may be deleted. A worktree whose only untracked files are ignored then becomes a candidate if it meets every other condition, and removal deletes those files with the worktree. The reason column ends with the number of ignored files to be deleted, for example `clean and integrated; deletes 2 ignored files`. Untracked files that are not ignored, staged or unstaged changes, and nested repositories or special files inside ignored directories still prevent removal. The option combines with `--include-unmerged`, `--github-merged` and `--reclaim-agent-locks`.
+
 Use `--github-merged` to check a clean, divergent branch against GitHub.com with an authenticated `gh` executable. This also works for squash or rebase merges if the merged PR has the exact local branch tip and its merge commit is in the base branch. The listing shows the matching PR URL. The cleaner queries it again before removal. Without this option, cleanup runs offline.
 
-On macOS, `--reclaim-agent-locks` checks Claude agent locks whose recorded owner has exited. Use it only for private worktrees created on this host, with no concurrent use or lock changes. A reused PID qualifies only when the recorded start times establish their order despite timezone uncertainty. The option keeps manual locks and worktrees with uncommitted or ignored files. A locked worktree needs evidence of integration even when `--include-unmerged` is set.
+On macOS, `--reclaim-agent-locks` checks Claude agent locks whose recorded owner has exited. Use it only for private worktrees created on this host, with no concurrent use or lock changes. A reused PID qualifies only when the recorded start times establish their order despite timezone uncertainty. The option keeps manual locks and worktrees with uncommitted files, and also those with ignored files unless `--allow-ignored` is given. A locked worktree needs evidence of integration even when `--include-unmerged` is set.
 
 ```sh
 worktree-cleaner --root ~/repositories/src/github.com/tett23 --reclaim-agent-locks --github-merged

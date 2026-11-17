@@ -1,6 +1,6 @@
 # ADR 0003: 作業を終えたエージェントのロックと GitHub のマージ記録を確認する
 
-Status: superseded [{"part":"アルゴリズム","by":["docs/adr/0009-remote-tracking-base.md"],"kind":"supplement"},{"part":"不変条件","by":["docs/adr/0010-keep-recently-active-worktrees.md"],"kind":"supplement"}]
+Status: superseded [{"part":"不変条件","by":["docs/adr/0008-allow-ignored-files.md"],"kind":"supplement"},{"part":"アルゴリズム","by":["docs/adr/0009-remote-tracking-base.md"],"kind":"supplement"},{"part":"不変条件","by":["docs/adr/0010-keep-recently-active-worktrees.md"],"kind":"supplement"}]
 
 ## 文脈
 

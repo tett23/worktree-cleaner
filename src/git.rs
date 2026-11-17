@@ -102,6 +102,11 @@ unsafe extern "C" {
         stage: c_int,
     ) -> *const GitIndexEntry;
     fn git_index_free(index: *mut c_void);
+    fn git_ignore_path_is_ignored(
+        ignored: *mut c_int,
+        repo: *mut c_void,
+        path: *const c_char,
+    ) -> c_int;
 }
 
 struct Repo(*mut c_void);
@@ -120,7 +125,18 @@ pub struct Inspection {
     lock: Option<(PathBuf, locks::LockEvidence)>,
     /// `origin/<name>` when `--remote-base` selected the remote-tracking branch.
     remote_base: Option<String>,
+    /// Ignored files the removal deletes; `None` unless `--allow-ignored` is set.
+    ignored: Option<usize>,
 }
+
+type Evidence<'a> = (
+    &'a OsString,
+    &'a [u8; 20],
+    bool,
+    &'a Option<github::Evidence>,
+    &'a Option<(PathBuf, locks::LockEvidence)>,
+    &'a Option<String>,
+);
 
 impl Inspection {
     pub fn reason(&self) -> String {
@@ -140,7 +156,23 @@ impl Inspection {
                 lock.explanation
             ));
         }
+        if let Some(count) = self.ignored {
+            reason.push_str(&format!("; deletes {count} ignored files"));
+        }
         reason
+    }
+
+    /// The evidence compared between selection and removal. The ignored file
+    /// count is reported, not compared (ADR 0008).
+    fn evidence(&self) -> Evidence<'_> {
+        (
+            &self.branch,
+            &self.commit,
+            self.unmerged,
+            &self.github,
+            &self.lock,
+            &self.remote_base,
+        )
     }
 }
 
@@ -371,17 +403,40 @@ fn base(repo: &Repo, explicit: Option<&OsStr>, remote: bool) -> Result<Base, Str
     })
 }
 
-unsafe extern "C" fn any_change(_path: *const c_char, _flags: u32, payload: *mut c_void) -> c_int {
-    unsafe {
-        *(payload as *mut bool) = true;
+const GIT_STATUS_IGNORED: u32 = 1 << 14;
+
+struct StatusScan {
+    allow_ignored: bool,
+    dirty: bool,
+}
+
+unsafe extern "C" fn any_change(_path: *const c_char, flags: u32, payload: *mut c_void) -> c_int {
+    let scan = unsafe { &mut *(payload as *mut StatusScan) };
+    if scan.allow_ignored && flags == GIT_STATUS_IGNORED {
+        return 0;
     }
+    scan.dirty = true;
     1
 }
 
-fn ensure_clean(repo: &Repo, root: &Path) -> Result<(), String> {
-    let mut dirty = false;
-    let code = unsafe { git_status_foreach(repo.0, any_change, (&mut dirty as *mut bool).cast()) };
-    if dirty {
+fn is_ignored(repo: &Repo, relative: &Path) -> Result<bool, String> {
+    let mut ignored: c_int = 0;
+    check(
+        unsafe { git_ignore_path_is_ignored(&mut ignored, repo.0, cpath(relative)?.as_ptr()) },
+        "check ignore rules",
+    )?;
+    Ok(ignored == 1)
+}
+
+/// Return the number of ignored files when `allow_ignored` permits them.
+fn ensure_clean(repo: &Repo, root: &Path, allow_ignored: bool) -> Result<usize, String> {
+    let mut scan = StatusScan {
+        allow_ignored,
+        dirty: false,
+    };
+    let code =
+        unsafe { git_status_foreach(repo.0, any_change, (&mut scan as *mut StatusScan).cast()) };
+    if scan.dirty {
         return Err(
             "working tree or index has changes, including untracked or ignored files".to_owned(),
         );
@@ -408,6 +463,7 @@ fn ensure_clean(repo: &Repo, root: &Path) -> Result<(), String> {
         }
     }
     // Independently account for every filesystem entry before pruning the directory.
+    let mut ignored = 0;
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
         for item in fs::read_dir(&directory).map_err(|e| format!("{}: {e}", directory.display()))? {
@@ -432,6 +488,10 @@ fn ensure_clean(repo: &Repo, root: &Path) -> Result<(), String> {
                     .to_path_buf();
                 let entry = unsafe { git_index_get_bypath(index.0, cpath(&relative)?.as_ptr(), 0) };
                 if entry.is_null() {
+                    if allow_ignored && is_ignored(repo, &relative)? {
+                        ignored += 1;
+                        continue;
+                    }
                     return Err(format!("untracked file: {}", item.path().display()));
                 }
                 if metadata.is_file() {
@@ -441,7 +501,7 @@ fn ensure_clean(repo: &Repo, root: &Path) -> Result<(), String> {
             }
         }
     }
-    Ok(())
+    Ok(ignored)
 }
 
 // A removal pass queries GitHub once, then repeats the local checks after the
@@ -669,7 +729,7 @@ fn evaluate(
             return Err("retained branch no longer points to HEAD".to_owned());
         }
     }
-    ensure_clean(&linked, &registered)?;
+    let ignored = ensure_clean(&linked, &registered, options.allow_ignored)?;
     let commit = unsafe { *(head_oid as *const [u8; 20]) };
     let github = if !included && options.github_merged {
         merged_pr(&main, &target, &commit, reply)?
@@ -687,6 +747,7 @@ fn evaluate(
         github,
         lock,
         remote_base: target.label(),
+        ignored: options.allow_ignored.then_some(ignored),
     };
     Ok(Checked {
         inspection,
@@ -732,7 +793,7 @@ pub fn inspect(
     let protected = |inspection: &Inspection| {
         inspection.unmerged || inspection.github.is_some() || inspection.lock.is_some()
     };
-    if (protected(&current) || protected(expected)) && &current != expected {
+    if (protected(&current) || protected(expected)) && current.evidence() != expected.evidence() {
         return Err(
             "worktree branch, commit, lock or integration evidence changed after selection".into(),
         );
@@ -750,7 +811,7 @@ pub fn inspect(
                 if unlocked {
                     wanted.lock = None;
                 }
-                if verified != wanted {
+                if verified.evidence() != wanted.evidence() {
                     return Err(
                         "worktree or integration evidence changed during lock reclamation".into(),
                     );
@@ -793,5 +854,36 @@ mod removal_tests {
         assert!(error.contains("removal may be partial"));
         assert!(error.contains("present (contents may be partially removed)"));
         assert!(error.ends_with(": absent"));
+    }
+
+    #[test]
+    fn adr0008_i9_recheck_keeps_worktree_with_new_untracked_file() {
+        let fixture = crate::common::Fixture::new();
+        let repo = fixture.repo("project", "main");
+        fs::write(repo.join(".gitignore"), "*.log\n").unwrap();
+        crate::common::git(&repo, &["add", ".gitignore"]);
+        crate::common::git(&repo, &["commit", "-m", "ignore logs"]);
+        let worktree = fixture.worktree(&repo, "done");
+        fs::write(worktree.join("build.log"), "log\n").unwrap();
+        init().unwrap();
+        let options = Options {
+            base: Some("main".into()),
+            allow_ignored: true,
+            ..Options::default()
+        };
+        let name = OsStr::new("done-worktree");
+        let selected = inspect(&repo, name, &worktree, &options, &repo, None).unwrap();
+        assert_eq!(
+            selected.reason(),
+            "clean and integrated; deletes 1 ignored files"
+        );
+        fs::write(worktree.join("notes"), "work\n").unwrap();
+        let error = inspect(&repo, name, &worktree, &options, &repo, Some(&selected)).unwrap_err();
+        assert!(error.contains("change"), "{error}");
+        assert_eq!(fs::read(worktree.join("notes")).unwrap(), b"work\n");
+        assert!(worktree.join("build.log").exists());
+        fs::remove_file(worktree.join("notes")).unwrap();
+        inspect(&repo, name, &worktree, &options, &repo, Some(&selected)).unwrap();
+        assert!(!worktree.exists());
     }
 }
