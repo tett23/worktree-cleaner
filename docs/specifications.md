@@ -63,6 +63,21 @@ HEAD が `refs/heads/<名前>` を指す worktree は、ローカルブランチ
 指定しないときの判定は変わらない。
 詳細は [ADR 0009](adr/0009-remote-tracking-base.md) に記載する。
 
+`--include-detached` を指定すると、HEAD がコミットを直接指す detached HEAD の worktree のうち、そのコミットが基準の先端と同じか祖先であるものを候補に加える。
+基準は既定の基準、または `--remote-base` を指定したときの `origin/<名前>` とする。
+候補の理由は `clean detached HEAD <コミット ID> is integrated into <基準の短い名前>` と表示する。
+コミット ID は 40 桁の 16 進数で、基準の短い名前は `<名前>` か `origin/<名前>` である。
+HEAD がブランチでもコミットでもなければ `worktree HEAD is neither a branch nor a commit` で保持する。
+管理ディレクトリの `refs/` の下にファイルがあれば、worktree 固有の参照が消えるため `worktree has worktree-specific refs` で保持する。
+基準に含まれない detached HEAD の worktree は、`--include-unmerged` を指定しても保持する。
+ロック付きの detached HEAD の worktree は、`--reclaim-agent-locks` を指定しても保持する。
+`--github-merged` を指定しても、detached HEAD の worktree については gh を起動しない。
+ほかの保護条件は、ブランチ上の worktree と同じく適用する。
+`--allow-ignored` と組み合わせると、無視ファイルだけを持つ detached HEAD の worktree も候補にし、理由の末尾に削除する無視ファイルの数を付ける。
+削除直前の再検査では、HEAD がまだ detached で、コミット ID が初回の判定と同じで、基準に含まれることを確かめる。
+指定しないときは、detached HEAD の worktree を `worktree HEAD is detached` で保持する。
+詳細は [ADR 0011](adr/0011-include-detached-integrated-worktrees.md) に記載する。
+
 `--reclaim-agent-locks` は同じ Mac で作成した専用の作業ディレクトリを対象とする。
 認識できる Claude エージェントのロックで、所有者の終了とブランチの統合を確認できた場合に限り、削除時に解除する。
 開始時刻にはタイムゾーンが記録されないため、PID 再利用の証拠には新旧の開始日時に 48 時間を超える差を求める。

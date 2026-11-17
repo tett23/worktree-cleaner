@@ -23,6 +23,8 @@ fn cleaner(cwd: &Path, args: &[&str], bin: Option<&Path>) -> Output {
         .env("GIT_CONFIG_COUNT", "0")
         .env_remove("GIT_CONFIG_PARAMETERS")
         .env("PATH", path)
+        // ADR 0010: fresh fixtures are candidates only without the activity protection.
+        .args(["--min-idle", "0"])
         .args(args)
         .output()
         .unwrap()
@@ -59,7 +61,13 @@ fn detached(fixture: &Fixture, repo: &Path, name: &str, commit: &str) -> PathBuf
     let path = fixture.path.join(format!("{name}-worktree"));
     git(
         repo,
-        &["worktree", "add", "--detach", path.to_str().unwrap(), commit],
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            path.to_str().unwrap(),
+            commit,
+        ],
     );
     path
 }
@@ -241,7 +249,11 @@ fn adr0011_i4_locked_detached_worktree_is_kept() {
             "--reclaim-agent-locks",
             "--include-unmerged",
         ],
-        &["--include-detached", "--reclaim-agent-locks", "--remove-all"],
+        &[
+            "--include-detached",
+            "--reclaim-agent-locks",
+            "--remove-all",
+        ],
     ] {
         let output = cleaner(&s.repo, args, None);
         assert!(output.status.success(), "{output:?}");
@@ -338,4 +350,40 @@ fn adr0011_i8_worktree_specific_refs_keep_the_worktree() {
     );
     assert!(!single.status.success());
     assert!(pinned.exists());
+}
+
+#[test]
+fn adr0011_i2_allow_ignored_counts_ignored_files_of_detached_worktree() {
+    let s = setup();
+    fs::write(s.repo.join(".gitignore"), "*.log\n").unwrap();
+    git(&s.repo, &["add", ".gitignore"]);
+    git(&s.repo, &["commit", "-m", "ignore logs"]);
+    let tip = rev(&s.repo, "HEAD");
+    let built = detached(&s.fixture, &s.repo, "built", &tip);
+    fs::write(built.join("build.log"), "output\n").unwrap();
+
+    let strict = cleaner(&s.repo, DETACHED, None);
+    assert!(strict.status.success(), "{strict:?}");
+    assert_eq!(row(&strict, &built).0, "keep");
+
+    let allowed = cleaner(&s.repo, &["--include-detached", "--allow-ignored"], None);
+    assert!(allowed.status.success(), "{allowed:?}");
+    let (_, reason) = integrated(&tip, "main");
+    assert_eq!(
+        row(&allowed, &built),
+        (
+            "candidate".to_owned(),
+            format!("{reason}; deletes 1 ignored files")
+        )
+    );
+
+    let removal = cleaner(
+        &s.repo,
+        &["--include-detached", "--allow-ignored", "--remove-all"],
+        None,
+    );
+    assert!(removal.status.success(), "{removal:?}");
+    assert_eq!(row(&removal, &built).0, "removed");
+    assert!(!built.exists());
+    assert!(is_ancestor(&s.repo, &tip, "main"));
 }
