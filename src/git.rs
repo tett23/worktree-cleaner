@@ -143,6 +143,9 @@ pub struct Inspection {
     /// The short name of the base that contains a detached HEAD
     /// (`--include-detached`); `None` for a worktree on a branch.
     detached: Option<String>,
+    /// Why the GitHub check failed for an unmerged candidate (ADR 0014).
+    /// Reported, not compared.
+    github_failure: Option<String>,
 }
 
 fn hex(oid: &[u8; 20]) -> String {
@@ -169,7 +172,11 @@ impl Inspection {
         } else if let Some(pr) = &self.github {
             format!("clean and integrated via {}", pr.url)
         } else if self.unmerged {
-            format!("clean unmerged branch {}", self.branch.to_string_lossy())
+            let mut reason = format!("clean unmerged branch {}", self.branch.to_string_lossy());
+            if let Some(failure) = &self.github_failure {
+                reason.push_str(&format!("; GitHub check failed: {failure}"));
+            }
+            reason
         } else if let Some(base) = &self.remote_base {
             format!("clean and integrated into {base}")
         } else {
@@ -966,10 +973,16 @@ fn evaluate(
     }
     let ignored = ensure_clean(&linked, &registered, options.allow_ignored)?;
     let commit = unsafe { *(head_oid as *const [u8; 20]) };
-    let github = if !included && options.github_merged {
-        merged_pr(&main, &target, &commit, reply)?
+    // ADR 0014: an unlocked unmerged candidate does not need GitHub evidence,
+    // so a failed check leaves it unmerged instead of keeping it.
+    let (github, github_failure) = if !included && options.github_merged {
+        match merged_pr(&main, &target, &commit, reply) {
+            Ok(github) => (github, None),
+            Err(failure) if options.include_unmerged && lock.is_none() => (None, Some(failure)),
+            Err(reason) => return Err(reason),
+        }
     } else {
-        None
+        (None, None)
     };
     let unmerged = !included && github.is_none();
     if unmerged && (!options.include_unmerged || lock.is_some()) {
@@ -984,6 +997,7 @@ fn evaluate(
         remote_base: target.label(),
         ignored: options.allow_ignored.then_some(ignored),
         detached: None,
+        github_failure,
     };
     Ok(Checked {
         inspection,
@@ -1108,6 +1122,7 @@ fn detached(
         remote_base: target.label(),
         ignored: allow_ignored.then_some(ignored),
         detached: Some(target.short_name()),
+        github_failure: None,
     })
 }
 

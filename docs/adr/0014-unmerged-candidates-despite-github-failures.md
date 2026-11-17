@@ -1,6 +1,6 @@
 # ADR 0014: `--include-unmerged` の候補を、GitHub の照会の失敗で保持しない
 
-Status: proposed
+Status: accepted
 
 ## 文脈
 
