@@ -1,6 +1,6 @@
 # ADR 0013: `--all` で、候補を広げる指定をすべて有効にする
 
-Status: proposed
+Status: accepted
 
 ## 文脈
 

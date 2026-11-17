@@ -86,6 +86,14 @@ HEAD がブランチでもコミットでもなければ `worktree HEAD is neith
 ほかのプロセスによる同時操作を止めて実行する。
 判定と復旧の条件は [ADR 0003](adr/0003-reclaim-agent-locks-and-check-merged-prs.md) に記載する。
 
+`--all` は、候補を広げる指定をまとめて有効にする。
+`--all` を指定した実行は、`--include-unmerged --include-detached --github-merged --reclaim-agent-locks --allow-ignored --remote-base --min-idle 0` を指定した実行と同じ判定をする。
+`--min-idle <時間数>` を一緒に指定したときは、`--min-idle 0` の代わりにその時間数を使う。
+`--all` と、ほかの 6 つの指定のどれかを一緒に指定した実行は、`--all` だけを指定した実行と同じ判定をする。
+`--all` を二度指定したときは、一覧も削除もせずに終了コード 1 で終わる。
+`--all` を指定しても、主 worktree、基準ブランチ自身、現在地を含む worktree は保持する。
+詳細は [ADR 0013](adr/0013-all-opt-in-candidates.md) に記載する。
+
 削除候補の一件が再検査や削除に失敗しても、理由を keep 行に出して残りの候補を処理する。
 部分削除の可能性と登録の残存状態、ロック復旧の結果を理由欄に含める。
 削除処理後に試行、削除完了、失敗の件数を標準エラーに出し、一件以上失敗していれば終了コード 1 を返す。

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const HELP: &str =
-    "Usage: worktree-cleaner [--root DIR] [--base BRANCH] [--remote-base] [--include-unmerged] [--include-detached] [--github-merged] [--reclaim-agent-locks] [--allow-ignored] [--min-idle HOURS] [--remove PATH | --remove-all]
+    "Usage: worktree-cleaner [--root DIR] [--base BRANCH] [--all] [--remote-base] [--include-unmerged] [--include-detached] [--github-merged] [--reclaim-agent-locks] [--allow-ignored] [--min-idle HOURS] [--remove PATH | --remove-all]
 
 List linked worktrees and explain which ones can be removed.
 Outside a repository, inspect repositories immediately below DIR (default: current directory).
@@ -23,7 +23,8 @@ The default base is the local branch corresponding to each repository's origin/H
 --include-unmerged also includes clean worktrees whose local branch retains their commits.
 --include-detached also includes clean detached HEAD worktrees whose commit the base contains.
 --allow-ignored stops ignored files from preventing removal and deletes them with the worktree.
---min-idle HOURS keeps worktrees whose HEAD, index or logs/HEAD changed within HOURS (default: 24; 0 disables).";
+--min-idle HOURS keeps worktrees whose HEAD, index or logs/HEAD changed within HOURS (default: 24; 0 disables).
+--all enables every option above that widens candidates and sets --min-idle 0 unless --min-idle is given.";
 
 #[derive(Default)]
 enum Action {
@@ -79,6 +80,7 @@ fn min_idle(value: Option<OsString>) -> Result<u64, String> {
 fn options() -> Result<Option<Options>, String> {
     let mut options = Options::default();
     let mut min_idle_given = false;
+    let mut all = false;
     let mut args = env::args_os().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || {
@@ -88,6 +90,7 @@ fn options() -> Result<Option<Options>, String> {
         };
         match arg.to_str() {
             Some("--help" | "-h") => return Ok(None),
+            Some("--all") if !all => all = true,
             Some("--root") if options.root.is_none() => options.root = Some(value()?.into()),
             Some("--base") if options.base.is_none() => options.base = Some(value()?),
             Some("--github-merged") if !options.github_merged => options.github_merged = true,
@@ -118,7 +121,26 @@ fn options() -> Result<Option<Options>, String> {
             _ => return Err(format!("unexpected or repeated option: {}", arg.display())),
         }
     }
-    Ok(Some(options))
+    Ok(Some(if all {
+        widen(options, min_idle_given)
+    } else {
+        options
+    }))
+}
+
+/// `--all` enables every option that widens candidates (ADR 0013). An
+/// explicit `--min-idle` keeps its value; otherwise the activity protection is off.
+fn widen(options: Options, min_idle_given: bool) -> Options {
+    Options {
+        include_unmerged: true,
+        include_detached: true,
+        github_merged: true,
+        remote_base: true,
+        reclaim_agent_locks: true,
+        allow_ignored: true,
+        min_idle: if min_idle_given { options.min_idle } else { 0 },
+        ..options
+    }
 }
 
 fn repositories(root: &Path) -> Result<BTreeSet<PathBuf>, String> {
