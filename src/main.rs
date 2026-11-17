@@ -11,11 +11,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const HELP: &str =
-    "Usage: worktree-cleaner [--root DIR] [--base BRANCH] [--include-unmerged] [--github-merged] [--reclaim-agent-locks] [--remove PATH | --remove-all]
+    "Usage: worktree-cleaner [--root DIR] [--base BRANCH] [--remote-base] [--include-unmerged] [--github-merged] [--reclaim-agent-locks] [--remove PATH | --remove-all]
 
 List linked worktrees and explain which ones can be removed.
 Outside a repository, inspect repositories immediately below DIR (default: current directory).
 The default base is the local branch corresponding to each repository's origin/HEAD.
+--remote-base uses the last fetched origin/BRANCH for that branch name instead (no fetch).
 --github-merged queries GitHub.com using gh for merged pull requests.
 --reclaim-agent-locks checks stale Claude locks on this Mac (exclusive local worktrees only).
 --remove PATH removes one eligible worktree. --remove-all removes all eligible worktrees.
@@ -35,6 +36,7 @@ struct Options {
     base: Option<OsString>,
     include_unmerged: bool,
     github_merged: bool,
+    remote_base: bool,
     reclaim_agent_locks: bool,
     action: Action,
 }
@@ -53,6 +55,7 @@ fn options() -> Result<Option<Options>, String> {
             Some("--root") if options.root.is_none() => options.root = Some(value()?.into()),
             Some("--base") if options.base.is_none() => options.base = Some(value()?),
             Some("--github-merged") if !options.github_merged => options.github_merged = true,
+            Some("--remote-base") if !options.remote_base => options.remote_base = true,
             Some("--reclaim-agent-locks") if !options.reclaim_agent_locks => {
                 options.reclaim_agent_locks = true
             }

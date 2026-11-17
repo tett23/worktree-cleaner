@@ -1,6 +1,6 @@
 # ADR 0009: 明示指定で、origin のリモート追跡ブランチを基準にする
 
-Status: accepted-pending
+Status: accepted
 
 ## 文脈
 

@@ -1,6 +1,6 @@
 # worktree-cleaner
 
-worktree-cleaner lists Git linked worktrees whose commits have been integrated into a local base branch. It can remove their working directories and Git registrations while retaining the branches.
+worktree-cleaner lists Git linked worktrees whose commits have been integrated into a base branch, which is a local branch unless you opt into its remote-tracking counterpart. It can remove their working directories and Git registrations while retaining the branches.
 
 ## Usage
 
@@ -15,11 +15,18 @@ The first command lists each worktree with its repository, path, decision and re
 
 Each repository uses the local branch named by its locally recorded `origin/HEAD`. For example, `origin/main` selects the local `main` branch. Supply `--base main` to choose that local branch explicitly. If the base cannot be resolved, the repository's worktrees are kept.
 
+If you merge pull requests on GitHub and only fetch locally, the local base branch falls behind `origin`. Pass `--remote-base` to measure reachability against `refs/remotes/origin/<name>` instead, where `<name>` is chosen in the same way as above. The cleaner never fetches, so this reference holds whatever your last fetch recorded. Worktrees integrated this way are listed as `clean and integrated into origin/<name>`. The worktree that has the local branch `<name>` checked out is still kept, and a repository without `refs/remotes/origin/<name>` keeps all of its worktrees. With `--include-unmerged`, a HEAD that `origin/<name>` cannot reach counts as unmerged. With `--github-merged`, the merge commit must be reachable from `origin/<name>`. Without `--remote-base`, decisions are unchanged.
+
+```sh
+git -C ~/repositories/src/github.com/tett23/project fetch origin
+worktree-cleaner --root ~/repositories/src/github.com/tett23 --remote-base
+```
+
 By default, a candidate must be on a local branch whose tip is reachable from the base tip. The cleaner keeps the base branch's worktree, locked worktrees by default, and the worktree containing the current directory. Staged or unstaged changes, untracked or ignored files, nested repositories, submodules, an unfinished Git operation or an inconclusive check also prevent removal.
 
 Use `--include-unmerged` to list clean worktrees whose commits are still on an unmerged local branch. Add `--remove PATH` or `--remove-all` to remove them while keeping the branch. The cleaner checks the branch name and commit again before removal. You can check out that branch later to recover the committed files.
 
-Use `--github-merged` to check a clean, divergent branch against GitHub.com with an authenticated `gh` executable. This also works for squash or rebase merges if the merged PR has the exact local branch tip and its merge commit is in the local base branch. The listing shows the matching PR URL. The cleaner queries it again before removal. Without this option, cleanup runs offline.
+Use `--github-merged` to check a clean, divergent branch against GitHub.com with an authenticated `gh` executable. This also works for squash or rebase merges if the merged PR has the exact local branch tip and its merge commit is in the base branch. The listing shows the matching PR URL. The cleaner queries it again before removal. Without this option, cleanup runs offline.
 
 On macOS, `--reclaim-agent-locks` checks Claude agent locks whose recorded owner has exited. Use it only for private worktrees created on this host, with no concurrent use or lock changes. A reused PID qualifies only when the recorded start times establish their order despite timezone uncertainty. The option keeps manual locks and worktrees with uncommitted or ignored files. A locked worktree needs evidence of integration even when `--include-unmerged` is set.
 
