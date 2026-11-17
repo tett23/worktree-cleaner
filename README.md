@@ -46,6 +46,14 @@ worktree-cleaner --root ~/repositories/src/github.com/tett23 --reclaim-agent-loc
 
 This command previews eligible worktrees without releasing any lock. Add `--remove PATH` or `--remove-all` to reclaim eligible locks and remove the corresponding worktrees.
 
+Use `--all` to widen the candidates as far as the cleaner allows. It is equivalent to `--include-unmerged --include-detached --github-merged --reclaim-agent-locks --allow-ignored --remote-base --min-idle 0`, so it also removes unmerged and recently active worktrees and deletes their ignored files. Pass `--min-idle HOURS` together with `--all` to keep the recent-activity protection. The main worktree, the base branch's worktree and the worktree containing the current directory are still kept.
+
+```sh
+git -C ~/repositories/src/github.com/tett23/project fetch origin
+worktree-cleaner --root ~/repositories/src/github.com/tett23 --all
+worktree-cleaner --root ~/repositories/src/github.com/tett23 --all --min-idle 24 --remove-all
+```
+
 ## Keep reasons
 
 The reason field of a `keep` row names the cause. A worktree with local changes shows the first path of its most significant kind of change: `tracked changes: <path>`, then `untracked file: <path>`, then `ignored file: <path>`. An ignored directory appears as one path ending in `/`. With `--allow-ignored`, ignored files are not reported this way.
