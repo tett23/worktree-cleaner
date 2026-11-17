@@ -3,6 +3,8 @@
 この文書は、`~/repositories/src/github.com/tett23` 配下の linked worktree を整理したときの判断と、その過程で見つかった CLI の改善点を記録する。
 CLI の判定だけでは削除できなかった worktree を手作業で判定したため、その基準を CLI に取り込むかどうかを検討する材料として残す。
 記録した事実は、本文に示したコマンドを 2026-11-16 08:00 から 08:20（JST）に実行して確かめたものである。
+2026-11-17 に、同じ作業の間に保存した一覧の出力と集計の表（各 worktree の状態、PR、更新時刻）を集計し直し、いくつかの数を足した。
+足した数は、どれも 2026-11-16 の作業中に取った出力からのものであり、2026-11-17 に測り直したものではない。
 
 ## 結果の要約
 
@@ -11,7 +13,7 @@ CLI の判定だけでは削除できなかった worktree を手作業で判定
 
 | 区分 | 件数 |
 | --- | ---: |
-| 統合済みで clean（無視ファイルだけ）、ロックなし | 88 |
+| 統合済みで clean（無視ファイルはあってもよい）、ロックなし | 88 |
 | 統合済みで clean、所有者が終了した Claude エージェントのロックを解除 | 5 |
 | macOS の /tmp 掃除で `.git` ファイルと追跡ファイルが消えていた登録 | 19 |
 
@@ -33,7 +35,7 @@ CLI の判定だけでは削除できなかった worktree を手作業で判定
 | Git operation is in progress | 4 |
 
 `--github-merged --reclaim-agent-locks` を加えても、候補は 0 件だった。
-このとき理由の内訳は、無視ファイルを含む変更ありが 119 件、PR のマージコミットがローカルにない（`object not found`）が 13 件、`GitHub query failed: exit status: 1` が 4 件などに変わった。
+このとき理由の内訳は、無視ファイルを含む変更ありが 119 件、PR のマージコミットがローカルにない（`check PR merge commit ancestry: object not found - no match for id (<コミット ID>)`）が 13 件、`GitHub query failed: exit status: 1` が 4 件などに変わった。
 この実行は Claude Code のサンドボックスの外で行った。
 サンドボックスの中では gh がキーチェーンの認証情報を読めず、GitHub への照会がすべて失敗した。
 
@@ -65,7 +67,8 @@ Git はこのとき無視ファイルを削除の妨げにしないため、条�
 ### origin の基準を統合の根拠にした理由
 
 ローカルの main が `origin/main` より大きく遅れていたため、ローカルの基準だけでは統合済みの worktree の多くを判定できなかった。
-遅れは sofel で 1107 コミット、peg-hs で 413、golem で 241 だった。
+遅れは `git rev-list --count main..origin/main` で、sofel が 1107 コミット、peg-hs が 413、golem が 241 だった。
+これらのリポジトリの `.git/FETCH_HEAD` の更新時刻（`stat`）は、sofel が 06:35、peg-hs が 06:49、golem が 07:32 で、どれも当日だった。
 `origin/main` は前回の fetch で記録されたリモート追跡ブランチであり、そこに含まれる HEAD は GitHub の main に取り込まれている。
 削除した 88 件のうち 82 件は、この根拠だけで統合済みと判定した。
 
@@ -74,7 +77,9 @@ Git はこのとき無視ファイルを削除の妨げにしないため、条�
 `.claude/worktrees/adr-guard-v0.13.0` という名前の 19 件は、どれも当日 06:26 から 07:56 に `HEAD` か `index` が更新されていた。
 そのうち worktree-cleaner の 1 件では、07:38 に起動した zsh がその中をカレントディレクトリにしていた。
 adr-guard リポジトリの 5 件も 1 から 3 時間前に更新されていた。
-これらは別のセッションが作業中と判断し、統合済みで clean なものも含めて 24 件を残した。
+これらは別のセッションが作業中と判断し、24 件を残した。
+24 件は、どれもほかの削除の条件（条件 1 から 4）を満たしていた。
+削除した 112 件の管理ディレクトリの `HEAD` と `index` の更新は、どれも 63 時間以上前だった。
 
 ## ロックの判定
 
@@ -129,6 +134,7 @@ CLI はこれらを `No such file or directory (os error 2)` と表示してい�
 未コミットの内容は、ADR の下書き、ソースの変更、検証用スクリプトなどだった。
 統合を確認できない 53 件のうち 8 件は、マージ済み PR の先端より 1 から 4 コミット進んでいた。
 その多くは `Merge remote-tracking branch 'origin/main'` や `Integrate current main before final checks` のような main の取り込みだったが、内容の差は確かめずに残した。
+また、統合を確認できない 53 件のうち、sofel の detached HEAD の 13 件は、PR がなく、HEAD がどのブランチとリモート追跡ブランチからも到達できなかった（`git for-each-ref --contains <HEAD> refs/heads refs/remotes`）。
 
 ## CLI の改善候補
 
@@ -137,20 +143,34 @@ CLI はこれらを `No such file or directory (os error 2)` と表示してい�
 
 ### 無視ファイルだけの worktree を削除できない
 
-観察: 削除した 88 件はすべて、無視ファイルがあるという理由で CLI の候補から外れていた。
+観察: 削除した 88 件のうち、ブランチ上の 53 件はどれも無視ファイルがあった。
+`--github-merged --reclaim-agent-locks` の実行では、53 件すべてがこの無視ファイルを理由に保持された。
+既定の一覧では、そのうち 48 件がローカルの基準の遅れによって `branch is not merged into base` で、5 件が無視ファイルで保持された。
+`--github-merged --reclaim-agent-locks` の一覧で変更ありを理由に保持された 119 件を `git status --porcelain --ignored -unormal` の行で分けると、93 件は無視ファイルしかなく、26 件には追跡ファイルの変更か無視されない未追跡のファイルがあった。
 保持理由の文言 `working tree or index has changes, including untracked or ignored files` は、無視ファイルだけの場合と、未コミットの変更がある場合を区別しない。
 
 案: 保持理由を、追跡ファイルの変更、未追跡ファイル、無視ファイルに分けて表示する。
 さらに、無視ファイルだけなら削除してよいことを明示するオプションを設ける。
 
+### 基準に含まれる detached HEAD の worktree を削除できない
+
+観察: 削除した 88 件のうち、残りの 35 件は detached HEAD だった。
+35 件の HEAD は、1 件がローカルの main に、34 件が `origin/main` に含まれていた。
+35 件のうち 20 件には無視ファイルがあり、15 件には無視ファイルもなかった。
+CLI は 35 件すべてを、既定の一覧でも `--github-merged --reclaim-agent-locks` の一覧でも `worktree HEAD is detached` で保持した。
+
+案: HEAD のコミットが基準に含まれる detached HEAD の worktree を、明示の指定で候補にする。
+このとき削除で失われるのは、作業ディレクトリのパスと、管理ディレクトリの worktree 固有の状態（HEAD の reflog、`ORIG_HEAD`、`FETCH_HEAD`、worktree 固有の参照など）である。
+
 ### ローカルの基準ブランチが古いと判定できない
 
 観察: 統合済みの 82 件は、`origin/main` に含まれていたが、ローカルの main には含まれていなかった。
-`--github-merged` でも、PR のマージコミットがローカルの基準にないため、13 件が `object not found` で保持された。
+`--github-merged` でも、PR のマージコミットのオブジェクトがローカルのリポジトリにないため、別の 13 件が `object not found` で保持された。
+この 13 件の HEAD は、ローカルの main にも `origin/main` にも含まれていなかった（`git merge-base --is-ancestor`）。
 整理後に同じコマンドを実行すると、作業中として残した `adr-guard-v0.13.0` の 13 件が同じ理由で保持された。
 
 案: 基準として `origin/<基準>` のリモート追跡ブランチを選べるようにする。
-また、マージコミットがローカルにない場合は `object not found` ではなく、基準が古いことを示す理由を表示する。
+また、マージコミットがローカルにない場合は `object not found` ではなく、fetch が要ることを示す理由を表示する。
 
 ### `.git` が消えた登録の理由が分かりにくい
 
@@ -179,7 +199,7 @@ HTTP 422 の場合は、HEAD が GitHub にないことを示す理由を表示�
 
 ### 作業中の worktree を検出しない
 
-観察: 統合済みで clean な worktree のうち 24 件は、当日に更新され、うち 1 件では別のシェルが動いていた。
+観察: 削除の条件 1 から 4 を満たす worktree のうち 24 件は、管理ディレクトリの `HEAD` か `index` が当日に更新され、うち 1 件では別のシェルが動いていた。
 CLI はこれらを区別せず、条件がそろえば候補にする。
 
 案: 管理ディレクトリの `HEAD` や `index` の更新時刻が一定時間内のものを保持する、または一覧に最終更新日時を表示する。

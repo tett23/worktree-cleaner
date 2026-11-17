@@ -1,6 +1,6 @@
 # ADR 0001: マージ済みの worktree を整理する
 
-Status: accepted
+Status: superseded [{"part":"不変条件","by":["docs/adr/0008-allow-ignored-files.md"],"kind":"supplement"},{"part":"実装すること","by":["docs/adr/0009-remote-tracking-base.md"],"kind":"supplement"},{"part":"不変条件","by":["docs/adr/0010-keep-recently-active-worktrees.md"],"kind":"supplement"},{"part":"不変条件","by":["docs/adr/0011-include-detached-integrated-worktrees.md"],"kind":"supplement"}]
 
 ## 文脈
 
