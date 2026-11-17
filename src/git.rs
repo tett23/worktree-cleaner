@@ -128,6 +128,13 @@ pub struct Inspection {
     remote_base: Option<String>,
     /// Ignored files the removal deletes; `None` unless `--allow-ignored` is set.
     ignored: Option<usize>,
+    /// The short name of the base that contains a detached HEAD
+    /// (`--include-detached`); `None` for a worktree on a branch.
+    detached: Option<String>,
+}
+
+fn hex(oid: &[u8; 20]) -> String {
+    oid.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 type Evidence<'a> = (
@@ -137,11 +144,17 @@ type Evidence<'a> = (
     &'a Option<github::Evidence>,
     &'a Option<(PathBuf, locks::LockEvidence)>,
     &'a Option<String>,
+    &'a Option<String>,
 );
 
 impl Inspection {
     pub fn reason(&self) -> String {
-        let mut reason = if let Some(pr) = &self.github {
+        let mut reason = if let Some(base) = &self.detached {
+            format!(
+                "clean detached HEAD {} is integrated into {base}",
+                hex(&self.commit)
+            )
+        } else if let Some(pr) = &self.github {
             format!("clean and integrated via {}", pr.url)
         } else if self.unmerged {
             format!("clean unmerged branch {}", self.branch.to_string_lossy())
@@ -173,6 +186,7 @@ impl Inspection {
             &self.github,
             &self.lock,
             &self.remote_base,
+            &self.detached,
         )
     }
 }
@@ -354,8 +368,17 @@ impl Base {
     }
 
     fn label(&self) -> Option<String> {
-        self.remote
-            .then(|| format!("origin/{}", String::from_utf8_lossy(&self.name)))
+        self.remote.then(|| self.short_name())
+    }
+
+    /// `<name>`, or `origin/<name>` with `--remote-base`.
+    fn short_name(&self) -> String {
+        let name = String::from_utf8_lossy(&self.name);
+        if self.remote {
+            format!("origin/{name}")
+        } else {
+            name.into_owned()
+        }
     }
 }
 
@@ -537,7 +560,7 @@ fn merged_pr(
     unsafe { git_remote_free(remote) };
     let url = url.ok_or("origin has no usable URL")?;
     let base = std::str::from_utf8(&target.name).map_err(|_| "invalid base branch")?;
-    let head_hex: String = head.iter().map(|byte| format!("{byte:02x}")).collect();
+    let head_hex = hex(head);
     let base_oid = unsafe { git_reference_target(target.reference.0) };
     if base_oid.is_null() {
         return Err("base has no commit".to_owned());
@@ -689,12 +712,31 @@ fn evaluate(
         Reference(pointer)
     };
     let head_name = unsafe { git_reference_name(head.0) };
-    if head_name.is_null()
-        || !unsafe { CStr::from_ptr(head_name) }
+    let on_branch = !head_name.is_null()
+        && unsafe { CStr::from_ptr(head_name) }
             .to_bytes()
-            .starts_with(b"refs/heads/")
-    {
-        return Err("worktree HEAD is detached".to_owned());
+            .starts_with(b"refs/heads/");
+    if !on_branch {
+        if !options.include_detached {
+            return Err("worktree HEAD is detached".to_owned());
+        }
+        let inspection = detached(
+            &main,
+            &linked,
+            &head,
+            &target,
+            options.allow_ignored,
+            &registration_dir,
+            &registered,
+        )?;
+        // A lock is never reclaimed for a detached HEAD (ADR 0011 I4).
+        if lock.is_some() {
+            return Err("worktree is locked".to_owned());
+        }
+        return Ok(Checked {
+            inspection,
+            worktree,
+        });
     }
     if unsafe { CStr::from_ptr(head_name) }.to_bytes() == target.branch_ref() {
         return Err("worktree uses base branch".to_owned());
@@ -750,6 +792,7 @@ fn evaluate(
         lock,
         remote_base: target.label(),
         ignored: options.allow_ignored.then_some(ignored),
+        detached: None,
     };
     Ok(Checked {
         inspection,
@@ -807,6 +850,76 @@ fn ensure_idle(registration_dir: &Path, min_idle: u64, now: SystemTime) -> Resul
     idle_since(last_activity(&paths)?, now, min_idle)
 }
 
+/// Whether `directory` holds any non-directory entry at any depth.
+fn holds_files(directory: &Path) -> Result<bool, String> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("{}: {error}", directory.display())),
+    };
+    entries
+        .map(|entry| {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            if fs::symlink_metadata(&path)
+                .map_err(|e| e.to_string())?
+                .is_dir()
+            {
+                holds_files(&path)
+            } else {
+                Ok(true)
+            }
+        })
+        .try_fold(false, |found, holds| Ok(found || holds?))
+}
+
+/// Decide a worktree whose HEAD is not on a local branch (ADR 0011).
+fn detached(
+    main: &Repo,
+    linked: &Repo,
+    head: &Reference,
+    target: &Base,
+    allow_ignored: bool,
+    registration_dir: &Path,
+    root: &Path,
+) -> Result<Inspection, String> {
+    let name = unsafe { git_reference_name(head.0) };
+    let head_oid = unsafe { git_reference_target(head.0) };
+    if name.is_null() || unsafe { CStr::from_ptr(name) } != c"HEAD" || head_oid.is_null() {
+        return Err("worktree HEAD is neither a branch nor a commit".to_owned());
+    }
+    // Removing the worktree would drop these refs and the commits only they reach.
+    if holds_files(&registration_dir.join("refs"))? {
+        return Err("worktree has worktree-specific refs".to_owned());
+    }
+    let target_oid = unsafe { git_reference_target(target.reference.0) };
+    if target_oid.is_null() {
+        return Err("base has no commit".to_owned());
+    }
+    let included = unsafe { git_oid_equal(target_oid, head_oid) } == 1
+        || match unsafe { git_graph_descendant_of(main.0, target_oid, head_oid) } {
+            1 => true,
+            0 => false,
+            _ => return Err(error("check commit ancestry")),
+        };
+    if !included {
+        return Err(format!(
+            "detached HEAD is not integrated into {}",
+            target.short_name()
+        ));
+    }
+    let ignored = ensure_clean(linked, root, allow_ignored)?;
+    Ok(Inspection {
+        branch: OsString::new(),
+        commit: unsafe { *(head_oid as *const [u8; 20]) },
+        unmerged: false,
+        github: None,
+        lock: None,
+        remote_base: target.label(),
+        ignored: allow_ignored.then_some(ignored),
+        detached: Some(target.short_name()),
+    })
+}
+
 fn prune(worktree: &Worktree, repo_path: &Path, name: &OsStr, path: &Path) -> Result<(), String> {
     // VALID permits an existing worktree and WORKING_TREE removes the directory.
     // Deliberately omit LOCKED so a reacquired lock still protects it.
@@ -843,7 +956,10 @@ pub fn inspect(
         return Ok(current);
     };
     let protected = |inspection: &Inspection| {
-        inspection.unmerged || inspection.github.is_some() || inspection.lock.is_some()
+        inspection.unmerged
+            || inspection.github.is_some()
+            || inspection.lock.is_some()
+            || inspection.detached.is_some()
     };
     if (protected(&current) || protected(expected)) && current.evidence() != expected.evidence() {
         return Err(

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const HELP: &str =
-    "Usage: worktree-cleaner [--root DIR] [--base BRANCH] [--remote-base] [--include-unmerged] [--github-merged] [--reclaim-agent-locks] [--allow-ignored] [--min-idle HOURS] [--remove PATH | --remove-all]
+    "Usage: worktree-cleaner [--root DIR] [--base BRANCH] [--remote-base] [--include-unmerged] [--include-detached] [--github-merged] [--reclaim-agent-locks] [--allow-ignored] [--min-idle HOURS] [--remove PATH | --remove-all]
 
 List linked worktrees and explain which ones can be removed.
 Outside a repository, inspect repositories immediately below DIR (default: current directory).
@@ -21,6 +21,7 @@ The default base is the local branch corresponding to each repository's origin/H
 --reclaim-agent-locks checks stale Claude locks on this Mac (exclusive local worktrees only).
 --remove PATH removes one eligible worktree. --remove-all removes all eligible worktrees.
 --include-unmerged also includes clean worktrees whose local branch retains their commits.
+--include-detached also includes clean detached HEAD worktrees whose commit the base contains.
 --allow-ignored stops ignored files from preventing removal and deletes them with the worktree.
 --min-idle HOURS keeps worktrees whose HEAD, index or logs/HEAD changed within HOURS (default: 24; 0 disables).";
 
@@ -36,6 +37,7 @@ struct Options {
     root: Option<PathBuf>,
     base: Option<OsString>,
     include_unmerged: bool,
+    include_detached: bool,
     github_merged: bool,
     remote_base: bool,
     reclaim_agent_locks: bool,
@@ -53,6 +55,7 @@ impl Default for Options {
             root: None,
             base: None,
             include_unmerged: false,
+            include_detached: false,
             github_merged: false,
             remote_base: false,
             reclaim_agent_locks: false,
@@ -99,6 +102,9 @@ fn options() -> Result<Option<Options>, String> {
             }
             Some("--include-unmerged") if !options.include_unmerged => {
                 options.include_unmerged = true
+            }
+            Some("--include-detached") if !options.include_detached => {
+                options.include_detached = true
             }
             Some("--remove-all") if matches!(options.action, Action::List) => {
                 options.action = Action::All
@@ -552,5 +558,55 @@ mod tests {
         common::git(&worktree, &["commit", "-m", "later"]);
         assert!(remove(selected, &options, &repo).is_err());
         assert!(worktree.exists());
+    }
+
+    /// A worktree detached at the parent of the base tip, and the two
+    /// inspections of the removal flow around a change made in between.
+    fn adr0011_recheck_after(change: impl FnOnce(&Path, &str)) {
+        let fixture = common::Fixture::new();
+        let repo = fixture.repo("repo", "main");
+        let parent = common::git(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
+        fs::write(repo.join("tracked"), "tip\n").unwrap();
+        common::git(&repo, &["commit", "-am", "tip"]);
+        let tip = common::git(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
+        common::git(&repo, &["branch", "side", &parent]);
+        let path = fixture.path.join("detached");
+        common::git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                path.to_str().unwrap(),
+                &parent,
+            ],
+        );
+        let path = path.canonicalize().unwrap();
+        git::init().unwrap();
+        let options = Options {
+            include_detached: true,
+            min_idle: 0,
+            ..Options::default()
+        };
+        let name = OsStr::new("detached");
+        let first = git::inspect(&repo, name, &path, &options, &repo, None).unwrap();
+        change(&path, &tip);
+        let second = git::inspect(&repo, name, &path, &options, &repo, Some(&first));
+        assert!(second.is_err(), "{second:?}");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn adr0011_i6_head_moved_to_another_integrated_commit_is_kept() {
+        adr0011_recheck_after(|path, tip| {
+            common::git(path, &["checkout", "--detach", tip]);
+        });
+    }
+
+    #[test]
+    fn adr0011_i6_branch_checked_out_after_selection_is_kept() {
+        adr0011_recheck_after(|path, _| {
+            common::git(path, &["checkout", "side"]);
+        });
     }
 }

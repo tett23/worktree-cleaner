@@ -1,6 +1,6 @@
 # ADR 0011: 明示指定で、基準に含まれる detached HEAD の worktree を候補にする
 
-Status: accepted-pending
+Status: accepted
 
 ## 文脈
 
