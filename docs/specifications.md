@@ -7,6 +7,7 @@ worktree-cleaner はローカルの Git リポジトリに登録された linked
 
 既定の削除候補は、基準ブランチに取り込まれたローカルブランチ上の clean な linked worktree とする。
 基準は各リポジトリの origin/HEAD に対応するローカルブランチ、または `--base` で指定したローカルブランチとする。
+`--remote-base` を指定したときは、後述のとおり origin のリモート追跡ブランチを基準にする。
 既定ではロック、作業中の変更、無視ファイルを含む未追跡ファイル、入れ子のリポジトリ、サブモジュール、進行中の Git 操作があれば保持する。
 主 worktree、基準ブランチ自身、現在地を含む worktree、判定に失敗した worktree も保持する。
 
@@ -21,8 +22,19 @@ worktree-cleaner はローカルの Git リポジトリに登録された linked
 追加条件は [ADR 0002](adr/0002-include-unmerged-worktrees.md) に記載する。
 
 `--github-merged` を指定すると、ローカルで未マージと判定した clean なブランチについて gh で GitHub.com に問い合わせる。
-現在の HEAD とマージ済み PR の先端、対象リポジトリ、基準ブランチが一致し、PR のマージコミットがローカルの基準から到達可能な場合を統合済みと扱う。
+現在の HEAD とマージ済み PR の先端、対象リポジトリ、基準ブランチが一致し、PR のマージコミットが基準から到達可能な場合を統合済みと扱う。
 削除前には同じ証拠を再取得する。
+
+`--remote-base` を指定すると、各リポジトリで基準の名前を同じ方法で決め、到達の判定には `refs/remotes/origin/<名前>` を使う。
+この参照は利用者が最後に fetch した時点の値であり、worktree-cleaner は fetch もローカルの基準ブランチの更新も行わない。
+`origin/<名前>` に取り込まれた worktree の理由は `clean and integrated into origin/<名前>` と表示する。
+HEAD が `refs/heads/<名前>` を指す worktree は、ローカルブランチ `<名前>` の有無にかかわらず保持する。
+`refs/remotes/origin/<名前>` がないリポジトリの worktree は理由を示して保持し、ほかのリポジトリの処理を続ける。
+`--include-unmerged` と組み合わせると、`origin/<名前>` から到達できない HEAD を未マージとして扱う。
+`--github-merged` と組み合わせると、GitHub に渡す基準の名前は `<名前>` とし、PR のマージコミットが `origin/<名前>` から到達可能であることを求める。
+削除直前の再検査でも同じ参照を使う。
+指定しないときの判定は変わらない。
+詳細は [ADR 0009](adr/0009-remote-tracking-base.md) に記載する。
 
 `--reclaim-agent-locks` は同じ Mac で作成した専用の作業ディレクトリを対象とする。
 認識できる Claude エージェントのロックで、所有者の終了とブランチの統合を確認できた場合に限り、削除時に解除する。

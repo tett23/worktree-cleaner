@@ -118,6 +118,8 @@ pub struct Inspection {
     pub unmerged: bool,
     github: Option<github::Evidence>,
     lock: Option<(PathBuf, locks::LockEvidence)>,
+    /// `origin/<name>` when `--remote-base` selected the remote-tracking branch.
+    remote_base: Option<String>,
 }
 
 impl Inspection {
@@ -126,6 +128,8 @@ impl Inspection {
             format!("clean and integrated via {}", pr.url)
         } else if self.unmerged {
             format!("clean unmerged branch {}", self.branch.to_string_lossy())
+        } else if let Some(base) = &self.remote_base {
+            format!("clean and integrated into {base}")
         } else {
             "clean and integrated".to_owned()
         };
@@ -301,28 +305,70 @@ pub fn worktrees(repo_path: &Path) -> Result<Vec<Registration>, String> {
     Ok(result)
 }
 
-fn base_ref(repo: &Repo, explicit: Option<&OsStr>) -> Result<Reference, String> {
-    let branch = if let Some(name) = explicit {
-        name.as_bytes().to_vec()
+/// The base that decides integration: the branch name every check compares
+/// against, and the reference whose tip is the reachability target.
+struct Base {
+    /// Branch name without a prefix, such as `main`.
+    name: Vec<u8>,
+    /// `refs/heads/<name>` by default, `refs/remotes/origin/<name>` with `--remote-base`.
+    reference: Reference,
+    remote: bool,
+}
+
+impl Base {
+    fn branch_ref(&self) -> Vec<u8> {
+        [b"refs/heads/".as_slice(), &self.name].concat()
+    }
+
+    fn label(&self) -> Option<String> {
+        self.remote
+            .then(|| format!("origin/{}", String::from_utf8_lossy(&self.name)))
+    }
+}
+
+fn base_name(repo: &Repo, explicit: Option<&OsStr>) -> Result<Vec<u8>, String> {
+    if let Some(name) = explicit {
+        return Ok(name.as_bytes().to_vec());
+    }
+    let origin_head = lookup_reference(repo, c"refs/remotes/origin/HEAD")?;
+    let target = unsafe { git_reference_symbolic_target(origin_head.0) };
+    if target.is_null() {
+        return Err("origin/HEAD is not symbolic".to_owned());
+    }
+    Ok(unsafe { CStr::from_ptr(target) }
+        .to_bytes()
+        .strip_prefix(b"refs/remotes/origin/")
+        .filter(|name| !name.is_empty())
+        .ok_or("origin/HEAD does not name an origin branch")?
+        .to_vec())
+}
+
+/// Select the base for one repository. Every check that needs the base,
+/// including the recheck before removal, goes through this function.
+fn base(repo: &Repo, explicit: Option<&OsStr>, remote: bool) -> Result<Base, String> {
+    let name = base_name(repo, explicit)?;
+    let prefix: &[u8] = if remote {
+        b"refs/remotes/origin/"
     } else {
-        let origin_head = lookup_reference(repo, c"refs/remotes/origin/HEAD")?;
-        let target = unsafe { git_reference_symbolic_target(origin_head.0) };
-        if target.is_null() {
-            return Err("origin/HEAD is not symbolic".to_owned());
-        }
-        unsafe { CStr::from_ptr(target) }
-            .to_bytes()
-            .strip_prefix(b"refs/remotes/origin/")
-            .filter(|name| !name.is_empty())
-            .ok_or("origin/HEAD does not name an origin branch")?
-            .to_vec()
+        b"refs/heads/"
     };
-    let mut full = b"refs/heads/".to_vec();
-    full.extend(branch);
-    lookup_reference(
-        repo,
-        &CString::new(full).map_err(|_| "invalid base branch".to_owned())?,
-    )
+    let full =
+        CString::new([prefix, &name].concat()).map_err(|_| "invalid base branch".to_owned())?;
+    let reference = lookup_reference(repo, &full).map_err(|reason| {
+        if remote {
+            format!(
+                "remote base {} is unavailable: {reason}",
+                full.to_string_lossy()
+            )
+        } else {
+            reason
+        }
+    })?;
+    Ok(Base {
+        name,
+        reference,
+        remote,
+    })
 }
 
 unsafe extern "C" fn any_change(_path: *const c_char, _flags: u32, payload: *mut c_void) -> c_int {
@@ -409,7 +455,7 @@ struct PrReply {
 
 fn merged_pr(
     main: &Repo,
-    target: &Reference,
+    target: &Base,
     head: &[u8; 20],
     reply: &mut Option<PrReply>,
 ) -> Result<Option<github::Evidence>, String> {
@@ -429,13 +475,12 @@ fn merged_pr(
     };
     unsafe { git_remote_free(remote) };
     let url = url.ok_or("origin has no usable URL")?;
-    let base = unsafe { CStr::from_ptr(git_reference_name(target.0)) }
-        .to_str()
-        .ok()
-        .and_then(|name| name.strip_prefix("refs/heads/"))
-        .ok_or("invalid base branch")?;
+    let base = std::str::from_utf8(&target.name).map_err(|_| "invalid base branch")?;
     let head_hex: String = head.iter().map(|byte| format!("{byte:02x}")).collect();
-    let base_oid = unsafe { git_reference_target(target.0) };
+    let base_oid = unsafe { git_reference_target(target.reference.0) };
+    if base_oid.is_null() {
+        return Err("base has no commit".to_owned());
+    }
     let reply = match reply {
         Some(previous)
             if previous.origin == url && previous.base == base && previous.head == *head =>
@@ -572,7 +617,7 @@ fn evaluate(
     } else {
         None
     };
-    let target = base_ref(&main, options.base.as_deref())?;
+    let target = base(&main, options.base.as_deref(), options.remote_base)?;
     let head = {
         let mut pointer = ptr::null_mut();
         check(
@@ -589,12 +634,10 @@ fn evaluate(
     {
         return Err("worktree HEAD is detached".to_owned());
     }
-    if unsafe { CStr::from_ptr(head_name) }
-        == unsafe { CStr::from_ptr(git_reference_name(target.0)) }
-    {
+    if unsafe { CStr::from_ptr(head_name) }.to_bytes() == target.branch_ref() {
         return Err("worktree uses base branch".to_owned());
     }
-    let target_oid = unsafe { git_reference_target(target.0) };
+    let target_oid = unsafe { git_reference_target(target.reference.0) };
     let head_oid = unsafe { git_reference_target(head.0) };
     if target_oid.is_null() || head_oid.is_null() {
         return Err("branch has no commit".to_owned());
@@ -643,6 +686,7 @@ fn evaluate(
         unmerged,
         github,
         lock,
+        remote_base: target.label(),
     };
     Ok(Checked {
         inspection,
