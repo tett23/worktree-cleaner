@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const HELP: &str =
-    "Usage: worktree-cleaner [--root DIR] [--base BRANCH] [--remote-base] [--include-unmerged] [--github-merged] [--reclaim-agent-locks] [--remove PATH | --remove-all]
+    "Usage: worktree-cleaner [--root DIR] [--base BRANCH] [--remote-base] [--include-unmerged] [--github-merged] [--reclaim-agent-locks] [--allow-ignored] [--remove PATH | --remove-all]
 
 List linked worktrees and explain which ones can be removed.
 Outside a repository, inspect repositories immediately below DIR (default: current directory).
@@ -20,7 +20,8 @@ The default base is the local branch corresponding to each repository's origin/H
 --github-merged queries GitHub.com using gh for merged pull requests.
 --reclaim-agent-locks checks stale Claude locks on this Mac (exclusive local worktrees only).
 --remove PATH removes one eligible worktree. --remove-all removes all eligible worktrees.
---include-unmerged also includes clean worktrees whose local branch retains their commits.";
+--include-unmerged also includes clean worktrees whose local branch retains their commits.
+--allow-ignored stops ignored files from preventing removal and deletes them with the worktree.";
 
 #[derive(Default)]
 enum Action {
@@ -60,6 +61,7 @@ fn options() -> Result<Option<Options>, String> {
             Some("--reclaim-agent-locks") if !options.reclaim_agent_locks => {
                 options.reclaim_agent_locks = true
             }
+            Some("--allow-ignored") if !options.allow_ignored => options.allow_ignored = true,
             Some("--include-unmerged") if !options.include_unmerged => {
                 options.include_unmerged = true
             }
