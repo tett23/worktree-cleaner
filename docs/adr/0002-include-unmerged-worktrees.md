@@ -1,6 +1,6 @@
 # ADR 0002: 明示指定で未マージのブランチの作業ディレクトリを片付ける
 
-Status: accepted
+Status: superseded [{"part":"不変条件","by":["docs/adr/0010-keep-recently-active-worktrees.md"],"kind":"supplement"},{"part":"実装しないこと","by":["docs/adr/0011-include-detached-integrated-worktrees.md"],"kind":"supplement"}]
 
 ## 文脈
 

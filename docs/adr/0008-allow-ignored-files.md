@@ -1,6 +1,6 @@
 # ADR 0008: 明示指定で、無視ファイルだけがある worktree を候補にする
 
-Status: proposed
+Status: accepted-pending
 
 ## 文脈
 

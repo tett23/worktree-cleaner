@@ -1,6 +1,6 @@
 # ADR 0004: 一件の削除失敗後も残りの候補を処理する
 
-Status: accepted
+Status: superseded [{"part":"不変条件","by":["docs/adr/0010-keep-recently-active-worktrees.md"],"kind":"supplement"}]
 
 ## 文脈
 
