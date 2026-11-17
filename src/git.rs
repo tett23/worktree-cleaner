@@ -108,6 +108,18 @@ unsafe extern "C" {
         repo: *mut c_void,
         path: *const c_char,
     ) -> c_int;
+    fn git_reference_foreach_name(
+        repo: *mut c_void,
+        callback: unsafe extern "C" fn(*const c_char, *mut c_void) -> c_int,
+        payload: *mut c_void,
+    ) -> c_int;
+    fn git_object_lookup(
+        out: *mut *mut c_void,
+        repo: *mut c_void,
+        id: *const c_void,
+        kind: c_int,
+    ) -> c_int;
+    fn git_object_free(object: *mut c_void);
 }
 
 struct Repo(*mut c_void);
@@ -427,20 +439,48 @@ fn base(repo: &Repo, explicit: Option<&OsStr>, remote: bool) -> Result<Base, Str
     })
 }
 
+const GIT_STATUS_WT_NEW: u32 = 1 << 7;
 const GIT_STATUS_IGNORED: u32 = 1 << 14;
 
-struct StatusScan {
+/// The first path the status callback reported for each kind of change, in
+/// the order the reason prefers them: tracked, untracked, ignored
+/// (docs/adr/0007). With `--allow-ignored`, ignored entries are not changes
+/// (docs/adr/0008).
+struct Changes {
     allow_ignored: bool,
-    dirty: bool,
+    first: [Option<Vec<u8>>; 3],
 }
 
-unsafe extern "C" fn any_change(_path: *const c_char, flags: u32, payload: *mut c_void) -> c_int {
-    let scan = unsafe { &mut *(payload as *mut StatusScan) };
-    if scan.allow_ignored && flags == GIT_STATUS_IGNORED {
+impl Changes {
+    fn kind(flags: u32) -> usize {
+        match flags {
+            GIT_STATUS_WT_NEW => 1,
+            GIT_STATUS_IGNORED => 2,
+            _ => 0,
+        }
+    }
+
+    fn reason(&self) -> Option<String> {
+        ["tracked changes", "untracked file", "ignored file"]
+            .iter()
+            .zip(&self.first)
+            .find_map(|(label, path)| {
+                path.as_ref()
+                    .map(|path| format!("{label}: {}", String::from_utf8_lossy(path)))
+            })
+    }
+}
+
+unsafe extern "C" fn record_change(path: *const c_char, flags: u32, payload: *mut c_void) -> c_int {
+    let changes = unsafe { &mut *(payload as *mut Changes) };
+    if changes.allow_ignored && flags == GIT_STATUS_IGNORED {
         return 0;
     }
-    scan.dirty = true;
-    1
+    let first = &mut changes.first[Changes::kind(flags)];
+    if first.is_none() && !path.is_null() {
+        *first = Some(unsafe { CStr::from_ptr(path) }.to_bytes().to_vec());
+    }
+    0
 }
 
 fn is_ignored(repo: &Repo, relative: &Path) -> Result<bool, String> {
@@ -454,18 +494,16 @@ fn is_ignored(repo: &Repo, relative: &Path) -> Result<bool, String> {
 
 /// Return the number of ignored files when `allow_ignored` permits them.
 fn ensure_clean(repo: &Repo, root: &Path, allow_ignored: bool) -> Result<usize, String> {
-    let mut scan = StatusScan {
+    let mut changes = Changes {
         allow_ignored,
-        dirty: false,
+        first: Default::default(),
     };
     let code =
-        unsafe { git_status_foreach(repo.0, any_change, (&mut scan as *mut StatusScan).cast()) };
-    if scan.dirty {
-        return Err(
-            "working tree or index has changes, including untracked or ignored files".to_owned(),
-        );
-    }
+        unsafe { git_status_foreach(repo.0, record_change, (&mut changes as *mut Changes).cast()) };
     check(code, "read worktree status")?;
+    if let Some(reason) = changes.reason() {
+        return Err(reason);
+    }
 
     let mut pointer = ptr::null_mut();
     check(
@@ -526,6 +564,19 @@ fn ensure_clean(repo: &Repo, root: &Path, allow_ignored: bool) -> Result<usize, 
         }
     }
     Ok(ignored)
+}
+
+/// Whether looking up the object reports that the repository lacks it.
+fn object_missing(repo: &Repo, oid: *const c_void) -> bool {
+    let mut object = ptr::null_mut();
+    // GIT_OBJECT_ANY
+    match unsafe { git_object_lookup(&mut object, repo.0, oid, -2) } {
+        0 => {
+            unsafe { git_object_free(object) };
+            false
+        }
+        code => code == -3,
+    }
 }
 
 // A removal pass queries GitHub once, then repeats the local checks after the
@@ -595,7 +646,144 @@ fn merged_pr(
         match unsafe { git_graph_descendant_of(main.0, base_oid, merge) } {
             1 => return Ok(Some(pr.clone())),
             0 | -3 => continue,
-            _ => return Err(error("check PR merge commit ancestry")),
+            _ => {
+                let failure = error("check PR merge commit ancestry");
+                return Err(if object_missing(main, merge) {
+                    format!(
+                        "merge commit {} of {} is not in the local repository; fetch origin to check it",
+                        pr.merge_commit, pr.url
+                    )
+                } else {
+                    failure
+                });
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn absent(path: &Path) -> bool {
+    matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+}
+
+fn parse_oid(text: &[u8]) -> Option<[u8; 20]> {
+    if text.len() != 40 {
+        return None;
+    }
+    let digits = text
+        .iter()
+        .map(|byte| (*byte as char).to_digit(16).map(|digit| digit as u8))
+        .collect::<Option<Vec<u8>>>()?;
+    let mut oid = [0u8; 20];
+    oid.iter_mut()
+        .zip(digits.chunks(2))
+        .for_each(|(byte, pair)| *byte = pair[0] << 4 | pair[1]);
+    Some(oid)
+}
+
+/// Explains a registration whose working directory or `.git` file is gone,
+/// before libgit2's validation reports only the first missing piece
+/// (docs/adr/0007).
+fn missing_checkout(main: &Repo, worktree: &Worktree, name: &OsStr) -> Option<String> {
+    let path = unsafe { path_from_c(git_worktree_path(worktree.0)) }.ok()?;
+    let state = if absent(&path) {
+        "worktree directory is missing"
+    } else if absent(&path.join(".git")) {
+        "worktree .git file is missing"
+    } else {
+        return None;
+    };
+    let head = unsafe { path_from_c(git_repository_commondir(main.0)) }
+        .map(|common| common.join("worktrees").join(name).join("HEAD"))
+        .and_then(|head| describe_head(main, &head))
+        .unwrap_or_else(|reason| format!("cannot inspect HEAD: {reason}"));
+    Some(format!("{state}; {head}"))
+}
+
+/// Describes what a registration's `HEAD` file names, read directly because
+/// libgit2 cannot open a repository for the missing checkout.
+fn describe_head(main: &Repo, head: &Path) -> Result<String, String> {
+    let content = fs::read(head).map_err(|e| format!("{}: {e}", head.display()))?;
+    let content = content.trim_ascii();
+    if let Some(target) = content.strip_prefix(b"ref: ") {
+        let branch = target
+            .trim_ascii()
+            .strip_prefix(b"refs/heads/")
+            .ok_or("HEAD names a reference outside refs/heads/")?;
+        let mut full = b"refs/heads/".to_vec();
+        full.extend(branch);
+        let full = CString::new(full).map_err(|_| "branch name contains NUL")?;
+        let mut pointer = ptr::null_mut();
+        let branch = String::from_utf8_lossy(branch);
+        return match unsafe { git_reference_lookup(&mut pointer, main.0, full.as_ptr()) } {
+            0 => {
+                drop(Reference(pointer));
+                Ok(format!("HEAD is branch {branch}"))
+            }
+            -3 => Ok(format!("HEAD is missing branch {branch}")),
+            _ => Err(error("resolve HEAD branch")),
+        };
+    }
+    let oid = parse_oid(content).ok_or("HEAD names neither a branch nor a commit")?;
+    Ok(match reachable_from(main, &oid)? {
+        Some(name) => format!("detached HEAD {} is reachable from {name}", hex(&oid)),
+        None => format!(
+            "detached HEAD {} is not reachable from any branch or remote-tracking branch",
+            hex(&oid)
+        ),
+    })
+}
+
+unsafe extern "C" fn collect_name(name: *const c_char, payload: *mut c_void) -> c_int {
+    let names = unsafe { &mut *(payload as *mut Vec<Vec<u8>>) };
+    if !name.is_null() {
+        names.push(unsafe { CStr::from_ptr(name) }.to_bytes().to_vec());
+    }
+    0
+}
+
+/// The short name of the bytewise smallest branch or remote-tracking branch
+/// whose tip is `oid` or a descendant of it. Symbolic references have no tip
+/// of their own and are skipped.
+fn reachable_from(main: &Repo, oid: &[u8; 20]) -> Result<Option<String>, String> {
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    check(
+        unsafe {
+            git_reference_foreach_name(
+                main.0,
+                collect_name,
+                (&mut names as *mut Vec<Vec<u8>>).cast(),
+            )
+        },
+        "list references",
+    )?;
+    let mut names: Vec<(Vec<u8>, &[u8])> = names
+        .iter()
+        .filter_map(|name| {
+            [&b"refs/heads/"[..], b"refs/remotes/"]
+                .iter()
+                .find_map(|prefix| name.strip_prefix(*prefix))
+                .map(|short| (name.clone(), short))
+        })
+        .collect();
+    names.sort();
+    let commit = oid.as_ptr().cast();
+    for (full, short) in names {
+        let reference = lookup_reference(
+            main,
+            &CString::new(full).map_err(|_| "reference name contains NUL")?,
+        )?;
+        let tip = unsafe { git_reference_target(reference.0) };
+        if tip.is_null() {
+            continue;
+        }
+        if unsafe { git_oid_equal(tip, commit) } == 1 {
+            return Ok(Some(String::from_utf8_lossy(short).into_owned()));
+        }
+        match unsafe { git_graph_descendant_of(main.0, tip, commit) } {
+            1 => return Ok(Some(String::from_utf8_lossy(short).into_owned())),
+            0 => {}
+            _ => return Err(error("check HEAD reachability")),
         }
     }
     Ok(None)
@@ -616,6 +804,9 @@ fn evaluate(
 ) -> Result<Checked, String> {
     let main = main_repo(repo_path)?;
     let worktree = lookup_worktree(&main, name)?;
+    if let Some(reason) = missing_checkout(&main, &worktree, name) {
+        return Err(reason);
+    }
     check(
         unsafe { git_worktree_validate(worktree.0) },
         "invalid worktree registration",
@@ -1048,7 +1239,7 @@ mod removal_tests {
         );
         fs::write(worktree.join("notes"), "work\n").unwrap();
         let error = inspect(&repo, name, &worktree, &options, &repo, Some(&selected)).unwrap_err();
-        assert!(error.contains("change"), "{error}");
+        assert_eq!(error, "untracked file: notes");
         assert_eq!(fs::read(worktree.join("notes")).unwrap(), b"work\n");
         assert!(worktree.join("build.log").exists());
         fs::remove_file(worktree.join("notes")).unwrap();

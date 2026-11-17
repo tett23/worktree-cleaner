@@ -1,10 +1,12 @@
 use std::ffi::OsStr;
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::process::Command;
+use std::process::ExitStatus;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Identity {
@@ -28,7 +30,55 @@ fn identity(path: &Path) -> Result<Identity, String> {
 enum Process {
     Absent,
     Started(String),
-    Unknown,
+    Unknown(Unknown),
+}
+
+/// Why the lock owner's state could not be established (docs/adr/0007).
+#[derive(Clone, Debug)]
+enum Unknown {
+    Kill {
+        pid: i32,
+        errno: i32,
+    },
+    PsExited(ExitStatus),
+    PsNoSingleStart,
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    Unsupported,
+}
+
+impl fmt::Display for Unknown {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unknown::Kill { pid, errno } => match errno_name(*errno) {
+                Some(name) => write!(formatter, "kill({pid}, 0) failed with {name}"),
+                None => write!(formatter, "kill({pid}, 0) failed with errno {errno}"),
+            },
+            Unknown::PsExited(status) => write!(formatter, "ps exited with {status}"),
+            Unknown::PsNoSingleStart => formatter.write_str("ps returned no single start time"),
+            Unknown::Unsupported => {
+                formatter.write_str("process inspection is unsupported on this platform")
+            }
+        }
+    }
+}
+
+/// Symbolic names of errno values 1 to 34, which macOS and Linux share
+/// except for 11.
+fn errno_name(errno: i32) -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    const ELEVEN: &str = "EDEADLK";
+    #[cfg(not(target_os = "macos"))]
+    const ELEVEN: &str = "EAGAIN";
+    const NAMES: [&str; 34] = [
+        "EPERM", "ENOENT", "ESRCH", "EINTR", "EIO", "ENXIO", "E2BIG", "ENOEXEC", "EBADF", "ECHILD",
+        ELEVEN, "ENOMEM", "EACCES", "EFAULT", "ENOTBLK", "EBUSY", "EEXIST", "EXDEV", "ENODEV",
+        "ENOTDIR", "EISDIR", "EINVAL", "ENFILE", "EMFILE", "ENOTTY", "ETXTBSY", "EFBIG", "ENOSPC",
+        "ESPIPE", "EROFS", "EMLINK", "EPIPE", "EDOM", "ERANGE",
+    ];
+    usize::try_from(errno)
+        .ok()
+        .and_then(|value| value.checked_sub(1))
+        .and_then(|index| NAMES.get(index).copied())
 }
 
 #[cfg(target_os = "macos")]
@@ -36,37 +86,58 @@ unsafe extern "C" {
     fn kill(pid: i32, signal: i32) -> i32;
 }
 
+/// Classifies the lock owner from the results of `kill(pid, 0)`, given as
+/// the errno on failure, and of `ps -o lstart=`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn probe_with<K, P>(pid: i32, kill: K, ps: P) -> Result<Process, String>
+where
+    K: Fn(i32) -> Result<(), i32>,
+    P: Fn(i32) -> Result<(ExitStatus, Vec<u8>), String>,
+{
+    match kill(pid) {
+        Err(3) => return Ok(Process::Absent),
+        Err(errno) => return Ok(Process::Unknown(Unknown::Kill { pid, errno })),
+        Ok(()) => {}
+    }
+    let (status, stdout) = ps(pid)?;
+    if !status.success() {
+        return Ok(Process::Unknown(Unknown::PsExited(status)));
+    }
+    let start = String::from_utf8(stdout).map_err(|err| err.to_string())?;
+    let start = start.trim();
+    if start.is_empty() || start.contains('\n') {
+        Ok(Process::Unknown(Unknown::PsNoSingleStart))
+    } else {
+        Ok(Process::Started(start.to_owned()))
+    }
+}
+
 fn probe_process(pid: i32) -> Result<Process, String> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = pid;
-        return Ok(Process::Unknown);
+        Ok(Process::Unknown(Unknown::Unsupported))
     }
     #[cfg(target_os = "macos")]
     {
-        if unsafe { kill(pid, 0) } != 0 {
-            let error = std::io::Error::last_os_error();
-            return if error.raw_os_error() == Some(3) {
-                Ok(Process::Absent)
-            } else {
-                Ok(Process::Unknown)
-            };
-        }
-        let output = Command::new("/bin/ps")
-            .args(["-p", &pid.to_string(), "-o", "lstart="])
-            .env("LC_ALL", "C")
-            .output()
-            .map_err(|err| format!("query process {pid}: {err}"))?;
-        if !output.status.success() {
-            return Ok(Process::Unknown);
-        }
-        let start = String::from_utf8(output.stdout).map_err(|err| err.to_string())?;
-        let start = start.trim();
-        if start.is_empty() || start.contains('\n') {
-            Ok(Process::Unknown)
-        } else {
-            Ok(Process::Started(start.to_owned()))
-        }
+        probe_with(
+            pid,
+            |pid| {
+                if unsafe { kill(pid, 0) } == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+                }
+            },
+            |pid| {
+                Command::new("/bin/ps")
+                    .args(["-p", &pid.to_string(), "-o", "lstart="])
+                    .env("LC_ALL", "C")
+                    .output()
+                    .map(|output| (output.status, output.stdout))
+                    .map_err(|err| format!("query process {pid}: {err}"))
+            },
+        )
     }
 }
 
@@ -217,7 +288,9 @@ where
             )
         }
         Process::Started(_) => return Err("lock owner may still be running".into()),
-        Process::Unknown => return Err("cannot establish that lock owner exited".into()),
+        Process::Unknown(cause) => {
+            return Err(format!("cannot establish that lock owner exited: {cause}"));
+        }
     };
     Ok(LockEvidence {
         reason,
@@ -357,6 +430,8 @@ pub struct LockEvidence {
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -406,7 +481,7 @@ mod tests {
         for state in [
             Process::Started("Thu Nov  5 16:31:45 2026".into()),
             Process::Started("Wed Nov  4 16:31:45 2026".into()),
-            Process::Unknown,
+            Process::Unknown(Unknown::Unsupported),
         ] {
             assert!(
                 inspect_with(
@@ -561,6 +636,91 @@ mod tests {
             },
         );
         assert!(result.unwrap_err().contains("lock restoration failed"));
+    }
+
+    fn unknown_reason<F>(probe: F) -> String
+    where
+        F: Fn(i32) -> Result<Process, String>,
+    {
+        let path = fixture();
+        let result = inspect_with(
+            &path,
+            path.parent().unwrap(),
+            OsStr::new("agent-abc"),
+            probe,
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        result.unwrap_err()
+    }
+
+    fn no_ps(_: i32) -> Result<(ExitStatus, Vec<u8>), String> {
+        panic!("ps must not run")
+    }
+
+    #[test]
+    fn adr0007_i7_kill_failure_names_errno() {
+        assert_eq!(
+            unknown_reason(|pid| probe_with(pid, |_| Err(1), no_ps)),
+            "cannot establish that lock owner exited: kill(123, 0) failed with EPERM"
+        );
+        assert_eq!(
+            unknown_reason(|pid| probe_with(pid, |_| Err(22), no_ps)),
+            "cannot establish that lock owner exited: kill(123, 0) failed with EINVAL"
+        );
+        assert_eq!(
+            unknown_reason(|pid| probe_with(pid, |_| Err(999), no_ps)),
+            "cannot establish that lock owner exited: kill(123, 0) failed with errno 999"
+        );
+        let path = fixture();
+        assert!(
+            inspect_with(
+                &path,
+                path.parent().unwrap(),
+                OsStr::new("agent-abc"),
+                |pid| { probe_with(pid, |_| Err(3), no_ps) }
+            )
+            .is_ok()
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn adr0007_i7_ps_failures_are_explained() {
+        assert_eq!(
+            unknown_reason(|pid| probe_with(
+                pid,
+                |_| Ok(()),
+                |_| Ok((ExitStatus::from_raw(1 << 8), Vec::new()))
+            )),
+            "cannot establish that lock owner exited: ps exited with exit status: 1"
+        );
+        for output in [
+            &b""[..],
+            b"  \n",
+            b"Thu Nov  5 16:31:45 2026\nThu Nov  5 16:31:45 2026\n",
+        ] {
+            assert_eq!(
+                unknown_reason(|pid| probe_with(
+                    pid,
+                    |_| Ok(()),
+                    |_| Ok((ExitStatus::from_raw(0), output.to_vec()))
+                )),
+                "cannot establish that lock owner exited: ps returned no single start time"
+            );
+        }
+    }
+
+    #[test]
+    fn adr0007_i7_unsupported_platform_is_explained() {
+        assert_eq!(
+            unknown_reason(|_| Ok(Process::Unknown(Unknown::Unsupported))),
+            "cannot establish that lock owner exited: process inspection is unsupported on this platform"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert!(matches!(
+            probe_process(1),
+            Ok(Process::Unknown(Unknown::Unsupported))
+        ));
     }
 
     #[test]

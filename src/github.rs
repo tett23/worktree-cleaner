@@ -80,6 +80,21 @@ fn parse_rows(
     Ok(result)
 }
 
+const STDERR_LIMIT: u64 = 64 * 1024;
+const LINE_LIMIT: usize = 200;
+
+/// The first non-empty line of gh's standard error, trimmed and cut to at
+/// most 200 bytes at a UTF-8 character boundary.
+fn first_line(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let end = (0..=line.len().min(LINE_LIMIT))
+        .rev()
+        .find(|&index| line.is_char_boundary(index))
+        .unwrap_or(0);
+    Some(line[..end].to_owned())
+}
+
 fn query_with_program(
     program: &Path,
     origin_url: &str,
@@ -101,16 +116,28 @@ fn query_with_program(
             ".[] | [.number, .merged_at, .head.sha, .base.repo.full_name, .base.ref, .merge_commit_sha] | @tsv", &endpoint])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| format!("start gh: {err}"))?;
     let stdout = child.stdout.take().ok_or("gh did not provide output")?;
+    let stderr = child.stderr.take().ok_or("gh did not provide errors")?;
     let reader = thread::spawn(move || {
         let mut bytes = Vec::new();
         stdout
             .take(4 * 1024 * 1024 + 1)
             .read_to_end(&mut bytes)
             .map(|_| bytes)
+    });
+    // Drain standard error to its end so gh never blocks on a full pipe,
+    // keeping only the head (docs/adr/0007).
+    let error_reader = thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut head = Vec::new();
+        (&mut stderr)
+            .take(STDERR_LIMIT)
+            .read_to_end(&mut head)
+            .and_then(|_| std::io::copy(&mut stderr, &mut std::io::sink()))
+            .map(|_| head)
     });
     let started = Instant::now();
     let status = loop {
@@ -136,7 +163,11 @@ fn query_with_program(
         .map_err(|_| "read GitHub response failed")?
         .map_err(|err| format!("read GitHub response: {err}"))?;
     if !status.success() {
-        return Err(format!("GitHub query failed: {status}"));
+        let errors = error_reader.join().ok().and_then(Result::ok);
+        return Err(match errors.as_deref().and_then(first_line) {
+            Some(line) => format!("GitHub query failed: {status}: {line}"),
+            None => format!("GitHub query failed: {status}"),
+        });
     }
     if bytes.len() > 4 * 1024 * 1024 {
         return Err("GitHub response is too large".into());
@@ -226,6 +257,76 @@ mod tests {
                 HEAD
             )
             .is_err()
+        );
+    }
+
+    fn failure(script: &str) -> String {
+        query_with_program(
+            &fixture(script),
+            "https://github.com/tett23/worktree-cleaner",
+            "main",
+            HEAD,
+        )
+        .unwrap_err()
+    }
+
+    #[test]
+    fn adr0007_i8_first_nonempty_stderr_line_is_trimmed_into_reason() {
+        assert_eq!(
+            failure(
+                "printf '\\n \\t\\n  gh: No commit found for SHA (HTTP 422)  \\nnext\\n' >&2; exit 1"
+            ),
+            "GitHub query failed: exit status: 1: gh: No commit found for SHA (HTTP 422)"
+        );
+        assert_eq!(
+            failure("printf 'tab\\there\\n' >&2; exit 1"),
+            "GitHub query failed: exit status: 1: tab\there"
+        );
+    }
+
+    #[test]
+    fn adr0007_i8_empty_stderr_keeps_status_only_reason() {
+        assert_eq!(failure("exit 1"), "GitHub query failed: exit status: 1");
+        assert_eq!(
+            failure("printf '\\n  \\n' >&2; exit 1"),
+            "GitHub query failed: exit status: 1"
+        );
+    }
+
+    #[test]
+    fn adr0007_i8_long_line_is_cut_at_200_bytes_on_a_char_boundary() {
+        let ascii = "a".repeat(201);
+        assert_eq!(
+            failure(&format!("printf '{ascii}\\n' >&2; exit 1")),
+            format!("GitHub query failed: exit status: 1: {}", "a".repeat(200))
+        );
+        let multibyte = format!("{}é", "a".repeat(199));
+        assert_eq!(multibyte.len(), 201);
+        assert_eq!(
+            failure(&format!("printf '{multibyte}\\n' >&2; exit 1")),
+            format!("GitHub query failed: exit status: 1: {}", "a".repeat(199))
+        );
+        assert_eq!(
+            failure(&format!("printf '{}\\n' >&2; exit 1", "a".repeat(200))),
+            format!("GitHub query failed: exit status: 1: {}", "a".repeat(200))
+        );
+    }
+
+    #[test]
+    fn adr0007_i8_i11_large_stderr_does_not_block_gh() {
+        let started = std::time::Instant::now();
+        let reason = failure(
+            "printf 'first line\\n' >&2; head -c 1048576 /dev/zero | tr '\\0' x >&2; printf '\\nlast\\n' >&2; exit 1",
+        );
+        assert_eq!(reason, "GitHub query failed: exit status: 1: first line");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    }
+
+    #[test]
+    fn adr0007_i8_invalid_utf8_is_replaced() {
+        assert_eq!(
+            failure("printf 'bad \\377 byte\\n' >&2; exit 1"),
+            "GitHub query failed: exit status: 1: bad \u{fffd} byte"
         );
     }
 }

@@ -46,6 +46,14 @@ worktree-cleaner --root ~/repositories/src/github.com/tett23 --reclaim-agent-loc
 
 This command previews eligible worktrees without releasing any lock. Add `--remove PATH` or `--remove-all` to reclaim eligible locks and remove the corresponding worktrees.
 
+## Keep reasons
+
+The reason field of a `keep` row names the cause. A worktree with local changes shows the first path of its most significant kind of change: `tracked changes: <path>`, then `untracked file: <path>`, then `ignored file: <path>`. An ignored directory appears as one path ending in `/`. With `--allow-ignored`, ignored files are not reported this way.
+
+A registration whose working directory or `.git` file has disappeared starts with `worktree directory is missing` or `worktree .git file is missing`. The rest tells what its `HEAD` names: a branch, a branch that no longer exists, or a detached commit together with a branch or remote-tracking branch that reaches it. A detached commit that no branch or remote-tracking branch reaches is reported as such. The cleaner never removes these registrations.
+
+Other reasons also carry their cause. An undecidable Claude lock owner shows the failed `kill` errno or the `ps` problem. A failed `gh` call shows the first line of its standard error. A merged PR whose merge commit is not in the local repository shows the commit and the PR URL; fetch origin and run the cleaner again.
+
 ## Installation
 
 Install stable Rust and the system libgit2 development library, then build from this checkout.
