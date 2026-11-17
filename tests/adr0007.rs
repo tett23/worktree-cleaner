@@ -278,8 +278,7 @@ fn github_fixture(script: impl Fn(&str) -> String) -> (Fixture, PathBuf, PathBuf
     let bin = fixture.path.join("bin");
     fs::create_dir(&bin).unwrap();
     let gh = bin.join("gh");
-    fs::write(&gh, format!("#!/bin/sh\n{}\n", script(&head))).unwrap();
-    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&gh, &format!("#!/bin/sh\n{}\n", script(&head)));
     (fixture, repo, path, bin)
 }
 

@@ -2,7 +2,6 @@ mod common;
 
 use common::{Fixture, git};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -288,15 +287,13 @@ fn adr0011_i2_i7_github_merged_does_not_query_detached_worktrees() {
     fs::create_dir(&bin).unwrap();
     let gh = bin.join("gh");
     let calls = s.fixture.path.join("calls");
-    fs::write(
+    common::write_executable(
         &gh,
-        format!(
+        &format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
             calls.to_str().unwrap()
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let list = cleaner(
         &s.repo,
         &["--include-detached", "--github-merged"],

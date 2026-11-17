@@ -180,7 +180,6 @@ fn query_with_program(
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -194,8 +193,21 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        // Tests run in parallel threads, and a child spawned by another thread
+        // shares this process's descriptors until it calls exec. A script
+        // written here could still be open for writing in such a child when it
+        // is executed, and Linux refuses that exec with ETXTBSY. `install`
+        // writes the script in its own process, so no thread here holds it.
+        let source = path.with_extension("source");
+        fs::write(&source, format!("#!/bin/sh\n{script}\n")).unwrap();
+        let status = std::process::Command::new("install")
+            .args(["-m", "700"])
+            .arg(&source)
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "install {}: {status}", path.display());
+        fs::remove_file(&source).unwrap();
         path
     }
 

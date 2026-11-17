@@ -89,3 +89,27 @@ pub fn git(cwd: &Path, args: &[&str]) -> String {
     );
     String::from_utf8(output.stdout).unwrap()
 }
+
+/// Writes an executable script at `path` without leaving a writable file
+/// descriptor for it in this process.
+///
+/// Tests run in parallel threads, and a thread that spawns a child shares
+/// this process's descriptors with the child until the child calls exec. A
+/// script written here with `fs::write` can still be open for writing in such
+/// a child when it is executed, and Linux then refuses the exec with ETXTBSY
+/// ("Text file busy"). `install` writes the script in its own process
+/// instead, so no thread of this process ever holds it open.
+#[allow(dead_code)]
+pub fn write_executable(path: &Path, script: &str) {
+    let source = path.with_extension("source");
+    fs::write(&source, script).unwrap();
+    let status = Command::new("install")
+        .arg("-m")
+        .arg("755")
+        .arg(&source)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "install {}: {status}", path.display());
+    fs::remove_file(&source).unwrap();
+}
