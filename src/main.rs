@@ -553,4 +553,47 @@ mod tests {
         assert!(remove(selected, &options, &repo).is_err());
         assert!(worktree.exists());
     }
+
+    /// A worktree detached at the parent of the base tip, and the two
+    /// inspections of the removal flow around a change made in between.
+    fn adr0011_recheck_after(change: impl FnOnce(&Path, &str)) {
+        let fixture = common::Fixture::new();
+        let repo = fixture.repo("repo", "main");
+        let parent = common::git(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
+        fs::write(repo.join("tracked"), "tip\n").unwrap();
+        common::git(&repo, &["commit", "-am", "tip"]);
+        let tip = common::git(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
+        common::git(&repo, &["branch", "side", &parent]);
+        let path = fixture.path.join("detached");
+        common::git(
+            &repo,
+            &["worktree", "add", "--detach", path.to_str().unwrap(), &parent],
+        );
+        let path = path.canonicalize().unwrap();
+        git::init().unwrap();
+        let options = Options {
+            include_detached: true,
+            ..Options::default()
+        };
+        let name = OsStr::new("detached");
+        let first = git::inspect(&repo, name, &path, &options, &repo, None).unwrap();
+        change(&path, &tip);
+        let second = git::inspect(&repo, name, &path, &options, &repo, Some(&first));
+        assert!(second.is_err(), "{second:?}");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn adr0011_i6_head_moved_to_another_integrated_commit_is_kept() {
+        adr0011_recheck_after(|path, tip| {
+            common::git(path, &["checkout", "--detach", tip]);
+        });
+    }
+
+    #[test]
+    fn adr0011_i6_branch_checked_out_after_selection_is_kept() {
+        adr0011_recheck_after(|path, _| {
+            common::git(path, &["checkout", "side"]);
+        });
+    }
 }
