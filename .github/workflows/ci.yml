@@ -10,9 +10,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      # A new branch or tag has no "before" (all zeros), and adr-guard would
-      # then check the whole history; start from the merge base with main
-      # instead (docs/adr/0006)
+      # A new branch or tag has no "before" (all zeros), and after a force
+      # push "before" is not an ancestor of HEAD; adr-guard would then check
+      # the whole history, so start from the merge base with main instead
+      # (docs/adr/0006, docs/adr/0012)
       - id: range
         env:
           EVENT: ${{ github.event_name }}
@@ -22,7 +23,7 @@ jobs:
         run: |
           if [ "$EVENT" = pull_request ]; then
             base="$PR_BASE"
-          elif [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ]; then
+          elif git merge-base --is-ancestor "$BEFORE" "$HEAD" 2>/dev/null; then
             base="$BEFORE"
           else
             base=$(git merge-base origin/main "$HEAD")
