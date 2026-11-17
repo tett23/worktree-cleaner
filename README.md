@@ -24,6 +24,12 @@ worktree-cleaner --root ~/repositories/src/github.com/tett23 --remote-base
 
 By default, a candidate must be on a local branch whose tip is reachable from the base tip. The cleaner keeps the base branch's worktree, locked worktrees by default, and the worktree containing the current directory. Staged or unstaged changes, untracked or ignored files, nested repositories, submodules, an unfinished Git operation or an inconclusive check also prevent removal.
 
+The cleaner also keeps a worktree with recent Git activity by default. The activity time is the latest modification time among the `HEAD`, `index` and `logs/HEAD` files in the worktree's administrative directory, `worktrees/<name>` in the repository's Git directory. A worktree is kept if this time is less than 24 hours ago, lies in the future, or cannot be read because none of the files exists or a time is unreadable. For recent activity, the reason field shows how many whole hours ago it happened. Because this check runs before the branch and cleanliness checks, a recently active worktree reports this reason even if it is detached, unmerged or dirty. Removal checks the time again just before deleting. Use `--min-idle HOURS` to change the period, or `--min-idle 0` to turn the check off.
+
+```sh
+worktree-cleaner --root ~/repositories/src/github.com/tett23 --min-idle 0
+```
+
 Use `--include-unmerged` to list clean worktrees whose commits are still on an unmerged local branch. Add `--remove PATH` or `--remove-all` to remove them while keeping the branch. The cleaner checks the branch name and commit again before removal. You can check out that branch later to recover the committed files.
 
 Use `--allow-ignored` when ignored files such as build output may be deleted. A worktree whose only untracked files are ignored then becomes a candidate if it meets every other condition, and removal deletes those files with the worktree. The reason column ends with the number of ignored files to be deleted, for example `clean and integrated; deletes 2 ignored files`. Untracked files that are not ignored, staged or unstaged changes, and nested repositories or special files inside ignored directories still prevent removal. The option combines with `--include-unmerged`, `--github-merged` and `--reclaim-agent-locks`.

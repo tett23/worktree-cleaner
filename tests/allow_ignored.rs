@@ -15,6 +15,8 @@ fn cleaner(cwd: &Path, args: &[&str]) -> Output {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_COUNT", "0")
         .env_remove("GIT_CONFIG_PARAMETERS")
+        // ADR 0010 I1: fresh worktrees are candidates only without the activity protection.
+        .args(["--min-idle", "0"])
         .args(args)
         .output()
         .unwrap()

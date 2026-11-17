@@ -1,6 +1,6 @@
 # ADR 0010: 最近 Git の管理ファイルが更新された worktree を保持する
 
-Status: accepted-pending
+Status: accepted
 
 ## 文脈
 
