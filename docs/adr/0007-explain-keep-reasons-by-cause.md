@@ -1,6 +1,6 @@
 # ADR 0007: 保持の理由を原因ごとに示す
 
-Status: accepted-pending
+Status: accepted
 
 ## 文脈
 
