@@ -24,6 +24,8 @@ fn cleaner(cwd: &Path, args: &[&str], bin: Option<&Path>) -> Output {
         .env("GIT_CONFIG_COUNT", "0")
         .env_remove("GIT_CONFIG_PARAMETERS")
         .env("PATH", path)
+        // ADR 0010 I1: fresh worktrees are candidates only without the activity protection.
+        .args(["--min-idle", "0"])
         .args(args)
         .output()
         .unwrap()
@@ -304,6 +306,8 @@ fn with_gh(cwd: &Path, args: &[&str], bin: &Path, calls: &Path, head: &str, merg
             "ROW",
             format!("1\t2026-11-11T10:31:27Z\t{head}\towner/project\tmain\t{merge}"),
         )
+        // ADR 0010 I1: fresh worktrees are candidates only without the activity protection.
+        .args(["--min-idle", "0"])
         .args(args)
         .output()
         .unwrap()

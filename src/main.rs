@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const HELP: &str =
-    "Usage: worktree-cleaner [--root DIR] [--base BRANCH] [--remote-base] [--include-unmerged] [--github-merged] [--reclaim-agent-locks] [--allow-ignored] [--remove PATH | --remove-all]
+    "Usage: worktree-cleaner [--root DIR] [--base BRANCH] [--remote-base] [--include-unmerged] [--github-merged] [--reclaim-agent-locks] [--allow-ignored] [--min-idle HOURS] [--remove PATH | --remove-all]
 
 List linked worktrees and explain which ones can be removed.
 Outside a repository, inspect repositories immediately below DIR (default: current directory).
@@ -21,7 +21,8 @@ The default base is the local branch corresponding to each repository's origin/H
 --reclaim-agent-locks checks stale Claude locks on this Mac (exclusive local worktrees only).
 --remove PATH removes one eligible worktree. --remove-all removes all eligible worktrees.
 --include-unmerged also includes clean worktrees whose local branch retains their commits.
---allow-ignored stops ignored files from preventing removal and deletes them with the worktree.";
+--allow-ignored stops ignored files from preventing removal and deletes them with the worktree.
+--min-idle HOURS keeps worktrees whose HEAD, index or logs/HEAD changed within HOURS (default: 24; 0 disables).";
 
 #[derive(Default)]
 enum Action {
@@ -31,7 +32,6 @@ enum Action {
     All,
 }
 
-#[derive(Default)]
 struct Options {
     root: Option<PathBuf>,
     base: Option<OsString>,
@@ -40,11 +40,42 @@ struct Options {
     remote_base: bool,
     reclaim_agent_locks: bool,
     allow_ignored: bool,
+    min_idle: u64,
     action: Action,
+}
+
+// The default keeps worktrees with Git activity in the last day (ADR 0010).
+const DEFAULT_MIN_IDLE: u64 = 24;
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            root: None,
+            base: None,
+            include_unmerged: false,
+            github_merged: false,
+            remote_base: false,
+            reclaim_agent_locks: false,
+            allow_ignored: false,
+            min_idle: DEFAULT_MIN_IDLE,
+            action: Action::default(),
+        }
+    }
+}
+
+/// Parse a non-negative decimal number of hours; signs, fractions and units are rejected.
+fn min_idle(value: Option<OsString>) -> Result<u64, String> {
+    let value = value.ok_or("missing value for --min-idle")?;
+    value
+        .to_str()
+        .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|text| text.parse().ok())
+        .ok_or_else(|| format!("invalid value for --min-idle: {}", value.display()))
 }
 
 fn options() -> Result<Option<Options>, String> {
     let mut options = Options::default();
+    let mut min_idle_given = false;
     let mut args = env::args_os().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || {
@@ -62,6 +93,10 @@ fn options() -> Result<Option<Options>, String> {
                 options.reclaim_agent_locks = true
             }
             Some("--allow-ignored") if !options.allow_ignored => options.allow_ignored = true,
+            Some("--min-idle") if !min_idle_given => {
+                options.min_idle = min_idle(args.next())?;
+                min_idle_given = true;
+            }
             Some("--include-unmerged") if !options.include_unmerged => {
                 options.include_unmerged = true
             }
@@ -303,6 +338,7 @@ mod tests {
         git::init().unwrap();
         let options = Options {
             action: Action::All,
+            min_idle: 0,
             ..Options::default()
         };
         let mut selected = select(&repo, &repo, &options).unwrap();
@@ -333,6 +369,7 @@ mod tests {
         git::init().unwrap();
         let options = Options {
             action: Action::All,
+            min_idle: 0,
             ..Options::default()
         };
         let cases: &[(&[bool], Summary, bool)] = &[
@@ -414,6 +451,7 @@ mod tests {
         git::init().unwrap();
         let options = Options {
             action: Action::All,
+            min_idle: 0,
             ..Options::default()
         };
         let selected = select(&repo, &repo, &options).unwrap();
@@ -439,6 +477,7 @@ mod tests {
         git::init().unwrap();
         let options = Options {
             action: Action::All,
+            min_idle: 0,
             ..Options::default()
         };
         let mut selected = select(&repo, &repo, &options).unwrap();
@@ -457,6 +496,7 @@ mod tests {
         let second = fixture.worktree(&repo, "changed");
         let options = Options {
             action: Action::All,
+            min_idle: 0,
             ..Options::default()
         };
         git::init().unwrap();
@@ -480,6 +520,7 @@ mod tests {
         let options = Options {
             include_unmerged: true,
             action: Action::All,
+            min_idle: 0,
             ..Options::default()
         };
         let selected = select(&repo, &repo, &options).unwrap();
@@ -501,6 +542,7 @@ mod tests {
         let options = Options {
             include_unmerged: true,
             action: Action::All,
+            min_idle: 0,
             ..Options::default()
         };
         let selected = select(&repo, &repo, &options).unwrap();

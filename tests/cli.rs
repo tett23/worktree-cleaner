@@ -4,8 +4,16 @@ use common::{Fixture, git};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, SystemTime};
 
+// Tests of earlier ADRs expect freshly created worktrees to be candidates, so
+// they disable the activity protection (ADR 0010 I1).
 fn cleaner(cwd: &Path, args: &[&str]) -> Output {
+    let args: Vec<&str> = ["--min-idle", "0"].iter().chain(args).copied().collect();
+    cleaner_default(cwd, &args)
+}
+
+fn cleaner_default(cwd: &Path, args: &[&str]) -> Output {
     let binary = env!("CARGO_BIN_EXE_worktree-cleaner");
     Command::new(binary)
         .current_dir(cwd)
@@ -491,4 +499,211 @@ fn adr0002_invariant_03_05_branch_survives_removal() {
         &["worktree", "add", recovered.to_str().unwrap(), "feature"],
     );
     assert_eq!(fs::read(recovered.join("committed")).unwrap(), b"unique\n");
+}
+
+const HOUR: Duration = Duration::from_secs(3600);
+const ACTIVITY_FILES: [&str; 3] = ["HEAD", "index", "logs/HEAD"];
+
+fn admin_dir(worktree: &Path) -> PathBuf {
+    PathBuf::from(git(worktree, &["rev-parse", "--absolute-git-dir"]).trim())
+}
+
+fn set_activity(worktree: &Path, time: SystemTime) {
+    for name in ACTIVITY_FILES {
+        fs::File::options()
+            .write(true)
+            .open(admin_dir(worktree).join(name))
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+}
+
+fn activity_times(worktree: &Path) -> Vec<SystemTime> {
+    ACTIVITY_FILES
+        .iter()
+        .map(|name| {
+            fs::metadata(admin_dir(worktree).join(name))
+                .unwrap()
+                .modified()
+                .unwrap()
+        })
+        .collect()
+}
+
+fn reason(output: &Output, path: &Path) -> String {
+    rows(output)
+        .into_iter()
+        .find(|fields| fields[1] == path.to_str().unwrap())
+        .unwrap_or_else(|| panic!("missing {}", path.display()))[3]
+        .clone()
+}
+
+#[test]
+fn adr0010_i1_min_idle_zero_keeps_previous_candidates() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo("project", "main");
+    let fresh = fixture.worktree(&repo, "fresh");
+    let future = fixture.worktree(&repo, "future");
+    set_activity(&future, SystemTime::now() + HOUR);
+    let output = cleaner_default(&repo, &["--min-idle", "0"]);
+    assert_eq!(decision(&output, &fresh), "candidate");
+    assert_eq!(decision(&output, &future), "candidate");
+    let output = cleaner_default(&repo, &["--min-idle", "0", "--remove-all"]);
+    assert_eq!(decision(&output, &fresh), "removed");
+    assert_eq!(decision(&output, &future), "removed");
+}
+
+#[test]
+fn adr0010_i2_i9_recent_activity_is_kept_by_default() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo("project", "main");
+    let fresh = fixture.worktree(&repo, "fresh");
+    let almost = fixture.worktree(&repo, "almost");
+    set_activity(
+        &almost,
+        SystemTime::now() - (24 * HOUR - Duration::from_secs(60)),
+    );
+    let output = cleaner_default(&repo, &[]);
+    assert_eq!(decision(&output, &fresh), "keep");
+    assert_eq!(
+        reason(&output, &fresh),
+        "worktree had Git activity 0 hours ago (less than --min-idle 24)"
+    );
+    assert_eq!(decision(&output, &almost), "keep");
+    assert_eq!(
+        reason(&output, &almost),
+        "worktree had Git activity 23 hours ago (less than --min-idle 24)"
+    );
+}
+
+#[test]
+fn adr0010_i2_i9_larger_min_idle_keeps_older_activity() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo("project", "main");
+    let worktree = fixture.worktree(&repo, "done");
+    set_activity(&worktree, SystemTime::now() - 25 * HOUR);
+    let output = cleaner_default(&repo, &["--min-idle", "48"]);
+    assert_eq!(decision(&output, &worktree), "keep");
+    assert_eq!(
+        reason(&output, &worktree),
+        "worktree had Git activity 25 hours ago (less than --min-idle 48)"
+    );
+    let output = cleaner_default(&repo, &["--min-idle", "18446744073709551615"]);
+    assert_eq!(
+        reason(&output, &worktree),
+        "worktree had Git activity 25 hours ago (less than --min-idle 18446744073709551615)"
+    );
+}
+
+#[test]
+fn adr0010_i3_idle_worktrees_are_candidates_by_default() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo("project", "main");
+    let just = fixture.worktree(&repo, "just");
+    set_activity(
+        &just,
+        SystemTime::now() - (24 * HOUR + Duration::from_secs(60)),
+    );
+    let older = fixture.worktree(&repo, "older");
+    set_activity(&older, SystemTime::now() - 25 * HOUR);
+    let output = cleaner_default(&repo, &[]);
+    assert_eq!(decision(&output, &just), "candidate");
+    assert_eq!(decision(&output, &older), "candidate");
+    let output = cleaner_default(&repo, &["--remove-all"]);
+    assert_eq!(decision(&output, &just), "removed");
+    assert_eq!(decision(&output, &older), "removed");
+    assert!(!just.exists() && !older.exists());
+}
+
+#[test]
+fn adr0010_i4_future_activity_is_kept_by_default() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo("project", "main");
+    let worktree = fixture.worktree(&repo, "future");
+    set_activity(&worktree, SystemTime::now() + HOUR);
+    let output = cleaner_default(&repo, &[]);
+    assert_eq!(decision(&output, &worktree), "keep");
+    assert_eq!(
+        reason(&output, &worktree),
+        "worktree Git activity time is in the future"
+    );
+}
+
+#[test]
+fn adr0010_i7_judgment_preserves_activity_times() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo("project", "main");
+    let idle = fixture.worktree(&repo, "idle");
+    set_activity(&idle, SystemTime::now() - 30 * HOUR);
+    let fresh = fixture.worktree(&repo, "fresh");
+    let before = (activity_times(&idle), activity_times(&fresh));
+    let output = cleaner_default(&repo, &[]);
+    assert_eq!(decision(&output, &idle), "candidate");
+    assert_eq!(decision(&output, &fresh), "keep");
+    assert_eq!((activity_times(&idle), activity_times(&fresh)), before);
+}
+
+#[test]
+fn adr0010_i8_invalid_min_idle_lists_and_removes_nothing() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo("project", "main");
+    let worktree = fixture.worktree(&repo, "done");
+    set_activity(&worktree, SystemTime::now() - 30 * HOUR);
+    for value in ["-1", "1.5", "24h", "", "+1", "18446744073709551616"] {
+        for action in [&[][..], &["--remove-all"][..]] {
+            let args: Vec<&str> = ["--min-idle", value]
+                .iter()
+                .chain(action)
+                .copied()
+                .collect();
+            let output = cleaner_default(&repo, &args);
+            assert_eq!(output.status.code(), Some(1), "{value:?}");
+            assert!(output.stdout.is_empty(), "{value:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr),
+                format!("worktree-cleaner: invalid value for --min-idle: {value}\n")
+            );
+            assert!(worktree.exists());
+        }
+    }
+}
+
+#[test]
+fn adr0010_i2_i10_activity_reason_precedes_other_keep_reasons() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo("project", "main");
+    let detached = fixture.worktree(&repo, "detached");
+    git(&detached, &["checkout", "--detach"]);
+    let unmerged = fixture.worktree(&repo, "unmerged");
+    fs::write(unmerged.join("new"), "new\n").unwrap();
+    git(&unmerged, &["add", "new"]);
+    git(&unmerged, &["commit", "-m", "diverge"]);
+    let untracked = fixture.worktree(&repo, "untracked");
+    fs::write(untracked.join("new"), "new\n").unwrap();
+    let base = fixture.worktree(&repo, "other-base");
+    let one_hour_ago = SystemTime::now() - HOUR;
+    for path in [&detached, &unmerged, &untracked, &base] {
+        set_activity(path, one_hour_ago);
+    }
+    let check = |output: &Output, path: &Path| {
+        assert_eq!(decision(output, path), "keep", "{}", path.display());
+        assert_eq!(
+            reason(output, path),
+            "worktree had Git activity 1 hours ago (less than --min-idle 24)",
+            "{}",
+            path.display()
+        );
+    };
+    let output = cleaner_default(&repo, &["--base", "main"]);
+    for path in [&detached, &unmerged, &untracked] {
+        check(&output, path);
+    }
+    check(&cleaner_default(&repo, &["--base", "other-base"]), &base);
+    check(&cleaner_default(&repo, &["--base", "missing"]), &base);
+    // Without the protection, the other reasons still apply.
+    let output = cleaner(&repo, &["--base", "main"]);
+    for path in [&detached, &unmerged, &untracked] {
+        assert!(!reason(&output, path).starts_with("worktree had Git activity"));
+    }
 }

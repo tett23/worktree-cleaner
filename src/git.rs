@@ -6,6 +6,7 @@ use std::fs;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::time::SystemTime;
 
 #[repr(C)]
 struct GitStrArray {
@@ -677,6 +678,7 @@ fn evaluate(
     } else {
         None
     };
+    ensure_idle(&registration_dir, options.min_idle, SystemTime::now())?;
     let target = base(&main, options.base.as_deref(), options.remote_base)?;
     let head = {
         let mut pointer = ptr::null_mut();
@@ -753,6 +755,56 @@ fn evaluate(
         inspection,
         worktree,
     })
+}
+
+// Activity protection (ADR 0010).
+const ACTIVITY_FILES: [&str; 3] = ["HEAD", "index", "logs/HEAD"];
+
+/// The latest modification time among the activity files that exist.
+fn last_activity(paths: &[PathBuf]) -> Result<SystemTime, String> {
+    paths
+        .iter()
+        .filter_map(|path| match fs::metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            metadata => Some(
+                metadata
+                    .and_then(|metadata| metadata.modified())
+                    .map_err(|error| {
+                        format!("cannot read worktree activity: {}: {error}", path.display())
+                    }),
+            ),
+        })
+        .collect::<Result<Vec<SystemTime>, String>>()?
+        .into_iter()
+        .max()
+        .ok_or_else(|| "cannot read worktree activity: no HEAD, index or logs/HEAD".to_owned())
+}
+
+fn idle_since(last: SystemTime, now: SystemTime, min_idle: u64) -> Result<(), String> {
+    let hours = now
+        .duration_since(last)
+        .map_err(|_| "worktree Git activity time is in the future".to_owned())?
+        .as_secs()
+        / 3600;
+    if hours < min_idle {
+        Err(format!(
+            "worktree had Git activity {hours} hours ago (less than --min-idle {min_idle})"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// With `min_idle` 0 the protection is off and no file time is read.
+fn ensure_idle(registration_dir: &Path, min_idle: u64, now: SystemTime) -> Result<(), String> {
+    if min_idle == 0 {
+        return Ok(());
+    }
+    let paths: Vec<PathBuf> = ACTIVITY_FILES
+        .iter()
+        .map(|name| registration_dir.join(name))
+        .collect();
+    idle_since(last_activity(&paths)?, now, min_idle)
 }
 
 fn prune(worktree: &Worktree, repo_path: &Path, name: &OsStr, path: &Path) -> Result<(), String> {
@@ -869,6 +921,7 @@ mod removal_tests {
         let options = Options {
             base: Some("main".into()),
             allow_ignored: true,
+            min_idle: 0,
             ..Options::default()
         };
         let name = OsStr::new("done-worktree");
@@ -885,5 +938,180 @@ mod removal_tests {
         fs::remove_file(worktree.join("notes")).unwrap();
         inspect(&repo, name, &worktree, &options, &repo, Some(&selected)).unwrap();
         assert!(!worktree.exists());
+    }
+}
+
+#[cfg(test)]
+mod adr0010_tests {
+    use super::*;
+    use crate::{Action, Options};
+    use std::time::Duration;
+
+    const HOUR: Duration = Duration::from_secs(3600);
+
+    fn files(dir: &Path, names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(|name| dir.join(name)).collect()
+    }
+
+    fn write_activity(dir: &Path, names: &[&str], time: SystemTime) {
+        for path in files(dir, names) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "x").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+        }
+    }
+
+    fn admin_dir(worktree: &Path) -> PathBuf {
+        let output = crate::common::git(worktree, &["rev-parse", "--absolute-git-dir"]);
+        PathBuf::from(output.trim())
+    }
+
+    fn set_activity(worktree: &Path, names: &[&str], time: SystemTime) {
+        for path in files(&admin_dir(worktree), names) {
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn adr0010_i1_min_idle_zero_reads_nothing() {
+        let fixture = crate::common::Fixture::new();
+        let now = SystemTime::now();
+        let empty = fixture.path.join("empty");
+        fs::create_dir(&empty).unwrap();
+        assert_eq!(ensure_idle(&empty, 0, now), Ok(()));
+        let future = fixture.path.join("future");
+        write_activity(&future, &ACTIVITY_FILES, now + HOUR);
+        assert_eq!(ensure_idle(&future, 0, now), Ok(()));
+        let fresh = fixture.path.join("fresh");
+        write_activity(&fresh, &ACTIVITY_FILES, now);
+        assert_eq!(ensure_idle(&fresh, 0, now), Ok(()));
+        // An unreadable time is not read at all with --min-idle 0.
+        let blocked = fixture.path.join("blocked");
+        fs::write(&blocked, "a file, not a directory").unwrap();
+        assert_eq!(ensure_idle(&blocked, 0, now), Ok(()));
+    }
+
+    #[test]
+    fn adr0010_i2_i9_less_than_min_idle_is_kept_with_truncated_hours() {
+        let now = SystemTime::now();
+        assert_eq!(
+            idle_since(now - (24 * HOUR - Duration::from_secs(60)), now, 24),
+            Err("worktree had Git activity 23 hours ago (less than --min-idle 24)".into())
+        );
+        assert_eq!(
+            idle_since(now - (24 * HOUR - Duration::from_nanos(1)), now, 24),
+            Err("worktree had Git activity 23 hours ago (less than --min-idle 24)".into())
+        );
+        assert_eq!(
+            idle_since(now - 25 * HOUR, now, 48),
+            Err("worktree had Git activity 25 hours ago (less than --min-idle 48)".into())
+        );
+        assert_eq!(
+            idle_since(now, now, 1),
+            Err("worktree had Git activity 0 hours ago (less than --min-idle 1)".into())
+        );
+        assert_eq!(
+            idle_since(now - 30 * HOUR, now, u64::MAX),
+            Err(format!(
+                "worktree had Git activity 30 hours ago (less than --min-idle {})",
+                u64::MAX
+            ))
+        );
+    }
+
+    #[test]
+    fn adr0010_i3_min_idle_or_more_is_eligible() {
+        let now = SystemTime::now();
+        assert_eq!(idle_since(now - 24 * HOUR, now, 24), Ok(()));
+        assert_eq!(idle_since(now - 25 * HOUR, now, 24), Ok(()));
+        assert_eq!(idle_since(now - HOUR, now, 1), Ok(()));
+    }
+
+    #[test]
+    fn adr0010_i3_latest_existing_file_decides() {
+        let fixture = crate::common::Fixture::new();
+        let now = SystemTime::now();
+        let only_head = fixture.path.join("only-head");
+        write_activity(&only_head, &["HEAD"], now - 30 * HOUR);
+        assert_eq!(ensure_idle(&only_head, 24, now), Ok(()));
+        let mixed = fixture.path.join("mixed");
+        write_activity(&mixed, &["HEAD", "logs/HEAD"], now - 30 * HOUR);
+        write_activity(&mixed, &["index"], now - 2 * HOUR);
+        assert_eq!(
+            ensure_idle(&mixed, 24, now),
+            Err("worktree had Git activity 2 hours ago (less than --min-idle 24)".into())
+        );
+    }
+
+    #[test]
+    fn adr0010_i4_future_activity_is_kept() {
+        let now = SystemTime::now();
+        assert_eq!(
+            idle_since(now + HOUR, now, 24),
+            Err("worktree Git activity time is in the future".into())
+        );
+        assert_eq!(
+            idle_since(now + Duration::from_nanos(1), now, 1),
+            Err("worktree Git activity time is in the future".into())
+        );
+    }
+
+    #[test]
+    fn adr0010_i5_no_activity_file_is_kept() {
+        let fixture = crate::common::Fixture::new();
+        let empty = fixture.path.join("empty");
+        fs::create_dir(&empty).unwrap();
+        assert_eq!(
+            ensure_idle(&empty, 24, SystemTime::now()),
+            Err("cannot read worktree activity: no HEAD, index or logs/HEAD".into())
+        );
+    }
+
+    #[test]
+    fn adr0010_i5_unreadable_time_is_kept() {
+        let fixture = crate::common::Fixture::new();
+        let now = SystemTime::now();
+        write_activity(&fixture.path, &["HEAD"], now - 30 * HOUR);
+        // A path below a regular file cannot be inspected (ENOTDIR), unlike a missing file.
+        let blocker = fixture.path.join("blocker");
+        fs::write(&blocker, "x").unwrap();
+        let unreadable = blocker.join("index");
+        let error = last_activity(&[fixture.path.join("HEAD"), unreadable.clone()]).unwrap_err();
+        let prefix = format!("cannot read worktree activity: {}: ", unreadable.display());
+        assert!(error.starts_with(&prefix), "{error}");
+        assert!(error.len() > prefix.len(), "{error}");
+    }
+
+    #[test]
+    fn adr0010_i6_activity_after_selection_prevents_removal() {
+        let fixture = crate::common::Fixture::new();
+        let repo = fixture.repo("repo", "main");
+        let worktree = fixture.worktree(&repo, "done");
+        let name = OsString::from("done-worktree");
+        set_activity(&worktree, &ACTIVITY_FILES, SystemTime::now() - 30 * HOUR);
+        init().unwrap();
+        let options = Options {
+            action: Action::All,
+            ..Options::default()
+        };
+        assert_eq!(options.min_idle, 24);
+        let selected = inspect(&repo, &name, &worktree, &options, &repo, None).unwrap();
+        set_activity(&worktree, &["index"], SystemTime::now());
+        let error = inspect(&repo, &name, &worktree, &options, &repo, Some(&selected)).unwrap_err();
+        assert_eq!(
+            error,
+            "worktree had Git activity 0 hours ago (less than --min-idle 24)"
+        );
+        assert!(worktree.exists());
     }
 }

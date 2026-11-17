@@ -8,6 +8,8 @@ use std::process::Command;
 fn invoke(repo: &Path, args: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_worktree-cleaner"))
         .current_dir(repo)
+        // ADR 0010 I1: fresh worktrees are candidates only without the activity protection.
+        .args(["--min-idle", "0"])
         .args(args)
         .output()
         .unwrap();

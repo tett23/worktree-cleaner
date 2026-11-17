@@ -34,6 +34,8 @@ fn adr0003_invariants_1_4_5_squashed_pr_requires_network_opt_in_and_fresh_eviden
     let changed = f.path.join("changed");
     let invoke = |args: &[&str], sha: &str| {
         Command::new(env!("CARGO_BIN_EXE_worktree-cleaner"))
+            // ADR 0010 I1: fresh worktrees are candidates only without the activity protection.
+            .args(["--min-idle", "0"])
             .args(args)
             .current_dir(&repo)
             .env(
