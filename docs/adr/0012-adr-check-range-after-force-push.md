@@ -1,6 +1,6 @@
 # ADR 0012: force push の後は、main との merge-base から ADR を検査する
 
-Status: proposed
+Status: accepted
 
 ## 文脈
 
