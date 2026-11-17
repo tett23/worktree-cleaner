@@ -3,7 +3,6 @@ mod common;
 use common::{Fixture, git};
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -283,12 +282,10 @@ fn fake_gh(fixture: &Fixture) -> (PathBuf, PathBuf) {
     let bin = fixture.path.join("bin");
     fs::create_dir(&bin).unwrap();
     let gh = bin.join("gh");
-    fs::write(
+    common::write_executable(
         &gh,
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALLS\"\nprintf '%s\\n' \"$ROW\"\n",
-    )
-    .unwrap();
-    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     (bin, fixture.path.join("calls"))
 }
 

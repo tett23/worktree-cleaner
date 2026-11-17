@@ -2,7 +2,6 @@ mod common;
 
 use common::{Fixture, git};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 #[test]
@@ -28,8 +27,10 @@ fn adr0003_invariants_1_4_5_squashed_pr_requires_network_opt_in_and_fresh_eviden
     let bin = f.path.join("bin");
     fs::create_dir(&bin).unwrap();
     let gh = bin.join("gh");
-    fs::write(&gh,"#!/bin/sh\necho call >> \"$CALLS\"\nif test -f \"$CHANGED\" && test \"$(wc -l < \"$CALLS\")\" -ge 2; then exit 0; fi\nprintf '%s\\n' \"$ROW\"\n").unwrap();
-    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(
+        &gh,
+        "#!/bin/sh\necho call >> \"$CALLS\"\nif test -f \"$CHANGED\" && test \"$(wc -l < \"$CALLS\")\" -ge 2; then exit 0; fi\nprintf '%s\\n' \"$ROW\"\n",
+    );
     let calls = f.path.join("calls");
     let changed = f.path.join("changed");
     let invoke = |args: &[&str], sha: &str| {
